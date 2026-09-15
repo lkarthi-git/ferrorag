@@ -1,11 +1,7 @@
 use tokio::io::{AsyncBufReadExt, BufReader,Error};
 use tokio::fs::File;
+use super::Source;
 
-pub trait Source {
-    type Item;
-    type Error;
-    fn next(&mut self) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + Send;
-}
 
 pub struct FileSource {
     lines: tokio::io::Lines<BufReader<File>>,
