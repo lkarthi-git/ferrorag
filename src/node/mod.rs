@@ -13,6 +13,9 @@ pub use timeout::TimeoutNode;
 pub use concurrency::ConcurrencyLimitNode;
 pub use circuit_breaker::CircuitBreakerNode;
 pub use rate_limit::RateLimitNode;
+pub use chunk::ChunkNode;
+pub use idempotency::IdempotencyNode;
+pub use ordering::OrderingNode;
 // 3. Define the core traits here (since everything relies on them)
 use std::future::Future;
 

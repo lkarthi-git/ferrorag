@@ -56,7 +56,10 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
             
             while let Some(input) = recv_error.recv().await {
                 trace!(node = %input.node_name, "Writing error to DLQ");
+                metrics::counter!("pipeline_dlq_events_total", "node" => input.node_name.clone()).increment(1);
+                let start = std::time::Instant::now();
                 dlq.write(input).await;
+                metrics::histogram!("pipeline_dlq_write_duration_seconds").record(start.elapsed().as_secs_f64());
             }
             
             if let Err(e) = dlq.writer.flush().await {
@@ -110,6 +113,8 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     {
         match res {
             Ok(Some(line)) => {
+                metrics::counter!("pipeline_source_pulled_total", "source" => source_name.to_string()).increment(1);
+
                 if send_raw.send(line).await.is_err() {
                     warn!("Downstream channel closed, stopping source polling");
                     return true;
@@ -154,13 +159,14 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
             let node_name = "ValidationNode";
 
             while let Some(input) = receiver.recv().await {
+                metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
                 if send.is_closed() {
                     warn!("Downstream channel closed, halting validation");
                     break;
                 }
                 
                 let span = info_span!("node_validate", node.name = node_name);
-
+                let start = std::time::Instant::now();
                 let validation_result = async {
                     validator(&input).inspect_err(|e| {
                         error!(error = %e, "Node validation failed");
@@ -168,14 +174,17 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 }
                 .instrument(span)
                 .await;
+                metrics::histogram!("pipeline_node_execution_duration_seconds", "node" => node_name).record(start.elapsed().as_secs_f64());
 
                 match validation_result {
                     Ok(_) => {
+                        metrics::counter!("pipeline_node_emitted_total", "node" => node_name).increment(1);
                         if send.send(input).await.is_err() {
                             break;
                         }
                     }
                     Err(error) => {
+                        metrics::counter!("pipeline_node_errors_total", "node" => node_name).increment(1);
                         let payload = ErrorPayload {
                             node_name: node_name.to_string(),
                             error_message: error.to_string(),
@@ -219,12 +228,13 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
             let node_name = std::any::type_name_of_val(&node);
             
             while let Some(input) = receiver.recv().await {
+                metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
                 if send.is_closed() {
                     warn!("Downstream channel closed, halting sequential pipe execution");
                     break; 
                 }
                 let span = info_span!("node_execute", node.name = node_name);
-
+                let start = std::time::Instant::now();
                 let output = async {
                     node.execute(&input)
                         .await
@@ -232,7 +242,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 }
                 .instrument(span) 
                 .await;                
-                
+                metrics::histogram!("pipeline_node_execution_duration_seconds", "node" => node_name).record(start.elapsed().as_secs_f64());
                 if Self::handle_node_result(output, &send, &send_error_clone, node_name, Some(&input)).await{
                     break;
                 }
@@ -276,6 +286,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
             let mut set: JoinSet<bool> = JoinSet::new();
 
             while let Some(input) = receiver.recv().await {
+                metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
                 if send.is_closed() {
                     warn!("Downstream channel closed, aborting concurrent tasks");
                     set.abort_all();
@@ -319,14 +330,19 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 
                 set.spawn(async move {
                     let span = info_span!("node_execute_concurrent", node.name = node_name);
-                    async {
+                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).increment(1.0);
+                    let start = std::time::Instant::now();
+                    let result = async {
                         let output: Result<Vec<O>, E> = node_ref.execute(&input)
                             .await
                             .inspect_err(|e| error!(error = %e, "Concurrent node execution failed"));
+                        metrics::histogram!("pipeline_node_execution_duration_seconds", "node" => node_name).record(start.elapsed().as_secs_f64());
                         Self::handle_node_result(output, &send_clone, &error_send_clone, node_name, Some(&input)).await
                     }
                     .instrument(span)
-                    .await
+                    .await;
+                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).decrement(1.0);
+                    result
                 });
             }
             
@@ -363,6 +379,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     {
         match result {
             Ok(items) => {
+                metrics::counter!("pipeline_node_emitted_total", "node" => node_name).increment(items.len() as u64);
                 for value in items {
                     if send_channel.send(value).await.is_err() {
                         return true; 
@@ -371,6 +388,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 false
             },
             Err(error) => {
+                metrics::counter!("pipeline_node_errors_total", "node" => node_name).increment(1);
                 let raw_data = match input {
                     Some(input) => format!("{:?}", input),
                     None => "Flush".to_string(),
@@ -435,7 +453,9 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     /// 1. DRAIN / EXECUTE
     pub async fn execute(mut self) {
         info!("Executing pipeline as drain...");
-        while let Some(_) = self.receiver.recv().await {}
+        while let Some(_) = self.receiver.recv().await {
+            metrics::counter!("pipeline_completed_total").increment(1);
+        }
         
         self.close_and_wait().await;
     }
@@ -445,6 +465,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
         info!("Executing pipeline as collect...");
         let mut results = Vec::new();
         while let Some(item) = self.receiver.recv().await {
+            metrics::counter!("pipeline_completed_total").increment(1);
             results.push(item);
         }
         
@@ -459,6 +480,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     {
         info!("Executing pipeline as for_each...");
         while let Some(item) = self.receiver.recv().await {
+            metrics::counter!("pipeline_completed_total").increment(1);
             action(item);
         }
         

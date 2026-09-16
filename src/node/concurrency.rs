@@ -45,12 +45,15 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+        let node_name = std::any::type_name::<N>();
         // Trace-level logging helps diagnose pipeline bottlenecks locally
         // without flooding production I/O.
         trace!(
             available_permits = self.no_of_requests.available_permits(),
             "Waiting to acquire concurrency permit"
         );
+
+        let wait_start = std::time::Instant::now();
         // Wait to acquire a permit before allowing execution.
         // The _permit is automatically dropped (released) when this function exits,
         // whether the inner node succeeds or returns an error.
@@ -64,8 +67,18 @@ where
                 "Concurrency semaphore closed"
             )
         })?;
+
+        metrics::histogram!("pipeline_node_concurrency_wait_duration_seconds", "node" => node_name)
+            .record(wait_start.elapsed().as_secs_f64());
+        // METRIC: Increment the active request gauge
+        metrics::gauge!("pipeline_node_concurrency_active_requests", "node" => node_name).increment(1.0);
+
+        let result = self.node.execute(input).await;
+
+        // METRIC: Decrement the active request gauge when execution finishes
+        metrics::gauge!("pipeline_node_concurrency_active_requests", "node" => node_name).decrement(1.0);
         
-        self.node.execute(input).await
+        result
     }
     
     fn flush(&self) -> Result<Self::Output, Self::Error> {

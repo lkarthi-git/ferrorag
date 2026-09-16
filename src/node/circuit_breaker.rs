@@ -64,6 +64,7 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+       let node_name = std::any::type_name::<N>();
        let probe_id = {
             // std::sync::Mutex doesn't need .await
             let mut state = self.state.lock().unwrap(); 
@@ -71,6 +72,7 @@ where
                 BreakerState::Closed { .. } => None,
                 BreakerState::Open { until } => {
                     if Instant::now() < until {
+                        metrics::counter!("pipeline_node_circuit_breaker_rejected_total", "node" => node_name).increment(1);
                         trace!("Circuit breaker is OPEN. Fast-failing request.");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other, 
@@ -79,6 +81,7 @@ where
                     } 
                     let id = self.probe_id.fetch_add(1, Ordering::Relaxed);
                     *state = BreakerState::HalfOpen { probe_id: id };
+                    metrics::gauge!("pipeline_node_circuit_breaker_state", "node" => node_name).set(1.0);
                     info!(
                         probe_id = id,
                         "Circuit breaker reset timeout reached. Transitioning to HALF-OPEN state and sending probe."
@@ -86,6 +89,7 @@ where
                     Some(id)
                 }
                 BreakerState::HalfOpen { .. } => {
+                    metrics::counter!("pipeline_node_circuit_breaker_rejected_total", "node" => node_name).increment(1);
                     trace!("Circuit breaker is HALF-OPEN. Fast-failing non-probe request.");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other, 
@@ -105,6 +109,7 @@ where
                         if Some(current_probe) == probe_id {
                             info!("Circuit breaker probe SUCCEEDED. Transitioning back to CLOSED state.");
                             *state = BreakerState::Closed { failures: 0 };
+                            metrics::gauge!("pipeline_node_circuit_breaker_state", "node" => node_name).set(0.0);
                         }
                     } else if let BreakerState::Closed { ref mut failures } = *state {
                         debug!("Request succeeded. Resetting consecutive failure count to 0.");
@@ -125,6 +130,8 @@ where
                                 *state = BreakerState::Open { 
                                     until: Instant::now() + self.reset_after 
                                 };
+                                metrics::counter!("pipeline_node_circuit_breaker_tripped_total", "node" => node_name).increment(1);
+                                metrics::gauge!("pipeline_node_circuit_breaker_state", "node" => node_name).set(2.0);
                             }
                             else{
                                 warn!(
@@ -145,6 +152,8 @@ where
                                 *state = BreakerState::Open { 
                                     until: Instant::now() + self.reset_after 
                                 };
+                                metrics::counter!("pipeline_node_circuit_breaker_tripped_total", "node" => node_name).increment(1);
+                                metrics::gauge!("pipeline_node_circuit_breaker_state", "node" => node_name).set(2.0);
                             } else {
                                 trace!("Lingering request failed while in HalfOpen state. Ignoring.");
                             }

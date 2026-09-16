@@ -44,10 +44,12 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+        let node_name = std::any::type_name::<N>();
         // tokio::time::timeout wraps the future and cancels it if the duration elapses.
         match tokio::time::timeout(self.timeout, self.node.execute(input)).await {
             Ok(inner_result) => inner_result,
             Err(_) => {
+                metrics::counter!("pipeline_node_timeouts_total", "node" => node_name).increment(1);
                 // Emitted on WARN because the pipeline had to actively step in 
                 // and abort the execution to protect system resources.
                 warn!(

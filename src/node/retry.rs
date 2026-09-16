@@ -62,6 +62,7 @@ where
     type Error = E;
     
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+            let node_name = std::any::type_name::<N>();
             let mut remaining_retries = self.retry_count;
             loop {
                 // Calculate this before the match so it represents the CURRENT attempt
@@ -70,6 +71,7 @@ where
                 match self.node.execute(input).await {
                     Ok(output) => {
                         if current_attempt > 1 {
+                            metrics::counter!("pipeline_node_retry_success_total", "node" => node_name).increment(1);
                             info!(
                                 total_attempts = current_attempt,
                                 "Operation succeeded after retries"
@@ -81,6 +83,7 @@ where
                         if remaining_retries > 0 && self.policy.is_transient(&error) {
                             remaining_retries -= 1;
                             
+                            metrics::counter!("pipeline_node_retries_total", "node" => node_name).increment(1);
                             // We use `current_attempt` for the backoff math so the first retry
                             // sleeps up to 2^1 (2s), the second up to 2^2 (4s), etc.
                             let base_delay = 2_u64.saturating_pow(current_attempt as u32).min(120);
@@ -96,6 +99,7 @@ where
                             
                             tokio::time::sleep(Duration::from_secs(jittered_delay)).await;
                         } else {
+                            metrics::counter!("pipeline_node_retry_exhausted_total", "node" => node_name).increment(1);
                             error!(
                                     error = %error,
                                     total_attempts = current_attempt,

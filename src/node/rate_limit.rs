@@ -63,6 +63,8 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+            let node_name = std::any::type_name::<N>();
+
             let wait_time = {
                 let mut state = self.state.lock().unwrap(); // Using std::sync::Mutex
                 
@@ -74,6 +76,7 @@ where
                 state.tokens = new_tokens.min(self.tokens_per_minute);
                 state.last_updated = now;
 
+                metrics::gauge!("pipeline_node_rate_limit_tokens", "node" => node_name).set(state.tokens);
                 if state.tokens >= 1.0 {
                     // We have a token! Consume it and return no wait time.
                     state.tokens -= 1.0;
@@ -102,9 +105,13 @@ where
 
             if let Some(duration) = wait_time {
                 if duration == Duration::MAX {
+                    metrics::counter!("pipeline_node_rate_limit_rejected_total", "node" => node_name).increment(1);
                     warn!(limit = self.tokens_per_minute, "Rate limit exceeded, rejecting request");
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "Rate limit exceeded").into());
                 } else {
+                    metrics::counter!("pipeline_node_rate_limit_delayed_total", "node" => node_name).increment(1);
+                    metrics::histogram!("pipeline_node_rate_limit_delay_duration_seconds", "node" => node_name)
+                    .record(duration.as_secs_f64());
                     trace!(wait_ms = duration.as_millis(), "Rate limit reached, sleeping until token regenerates");
                     tokio::time::sleep(duration).await;
                 }

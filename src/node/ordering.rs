@@ -55,6 +55,7 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+        let node_name = std::any::type_name::<N>();
         let seq_id = input.get_sequence_id();
         trace!(seq_id = seq_id, "Executing ordered item");
 
@@ -80,6 +81,9 @@ where
                     }
                 }
 
+                metrics::gauge!("pipeline_node_ordering_buffer_depth", "node" => node_name)
+                    .set(state.buffer.len() as f64);
+
                 if ids_emitted == 0 {
                     trace!(
                         seq_id = seq_id,
@@ -87,6 +91,8 @@ where
                         "Item buffered (out of order)"
                     );
                 } else {
+                    metrics::counter!("pipeline_node_ordering_released_total", "node" => node_name)
+                        .increment(ids_emitted as u64);
                     debug!(
                         seq_id = seq_id,
                         items_released = ids_emitted,
@@ -100,6 +106,8 @@ where
             Err(e) => {
                 let mut state = self.state.lock().unwrap();
                 
+                metrics::counter!("pipeline_node_ordering_tombstones_total", "node" => node_name).increment(1);
+
                 warn!(
                     seq_id = seq_id,
                     "Item failed. Inserting tombstone to prevent sequence deadlock."
@@ -110,6 +118,8 @@ where
                 // it will simply pop the empty vector, increment, and move on to the next items,
                 // rather than deadlocking the pipeline waiting for a failed item.
                 state.buffer.insert(seq_id, Vec::new());
+
+                metrics::gauge!("pipeline_node_ordering_buffer_depth", "node" => node_name).set(state.buffer.len() as f64);
                 
                 Err(e)
             }

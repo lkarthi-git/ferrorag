@@ -31,48 +31,75 @@ impl<T: Clone + Send + Sync> Node for ChunkNode<T> {
     type Error = std::io::Error;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-        let mut buf = self.buffer.lock().unwrap();
-        buf.push(input.clone());
-        
-        if buf.len() >= self.batch_size {
-            // Batch is full! Swap it out for a fresh, empty buffer.
-            let chunk = std::mem::take(&mut *buf);
+            let node_name = std::any::type_name::<Self>();
             
-            debug!(
-                chunk_size = chunk.len(), 
-                "Batch size reached. Emitting chunk downstream."
-            );
-            
-            // Wrap the chunk in a Vec so the pipeline flattens it correctly.
-            Ok(vec![chunk])
-        } else {
-            // Batch is still filling.
-            trace!(
-                current_size = buf.len(), 
-                target_size = self.batch_size, 
-                "Item buffered."
-            );
-            
-            // Emit nothing for now.
-            Ok(Vec::new())
-        }
-    }
+            let chunk_to_emit = {
+                let mut buf = self.buffer.lock().unwrap();
+                buf.push(input.clone());
+                
+                // METRIC: Update the gauge to reflect the current buffer size
+                metrics::gauge!("pipeline_node_chunk_buffer_depth", "node" => node_name)
+                    .set(buf.len() as f64);
+                
+                if buf.len() >= self.batch_size {
+                    // Batch is full! Swap it out for a fresh, empty buffer.
+                    let chunk = std::mem::take(&mut *buf);
+                    
+                    // METRIC: Buffer is now empty
+                    metrics::gauge!("pipeline_node_chunk_buffer_depth", "node" => node_name).set(0.0);
+                    
+                    Some(chunk)
+                } else {
+                    None
+                }
+            }; // Mutex drops here
 
-    fn flush(&self) -> Result<Self::Output, Self::Error> {
-        let mut buf = self.buffer.lock().unwrap();
-        let remainder = std::mem::take(&mut *buf);
-        
-        if !remainder.is_empty() {
-            debug!(
-                chunk_size = remainder.len(), 
-                "Flushing partial chunk at pipeline shutdown."
-            );
-            Ok(vec![remainder])
-        } else {
-            trace!("Flush called, but buffer is already empty.");
-            Ok(Vec::new())
+            if let Some(chunk) = chunk_to_emit {
+                // METRIC: Track successful full batches
+                metrics::counter!("pipeline_node_chunk_full_batches_total", "node" => node_name).increment(1);
+                
+                debug!(
+                    chunk_size = chunk.len(), 
+                    "Batch size reached. Emitting chunk downstream."
+                );
+                
+                Ok(vec![chunk])
+            } else {
+                trace!(
+                    target_size = self.batch_size, 
+                    "Item buffered."
+                );
+                Ok(Vec::new())
+            }
         }
-    }
+
+        fn flush(&self) -> Result<Self::Output, Self::Error> {
+            let node_name = std::any::type_name::<Self>();
+            
+            let remainder = {
+                let mut buf = self.buffer.lock().unwrap();
+                let remainder = std::mem::take(&mut *buf);
+                
+                // METRIC: Buffer is now permanently empty
+                metrics::gauge!("pipeline_node_chunk_buffer_depth", "node" => node_name).set(0.0);
+                
+                remainder
+            };
+            
+            if !remainder.is_empty() {
+                // METRIC: Track partial flushes during shutdown
+                metrics::counter!("pipeline_node_chunk_partial_flushes_total", "node" => node_name).increment(1);
+                
+                debug!(
+                    chunk_size = remainder.len(), 
+                    "Flushing partial chunk at pipeline shutdown."
+                );
+                Ok(vec![remainder])
+            } else {
+                trace!("Flush called, but buffer is already empty.");
+                Ok(Vec::new())
+            }
+        }
 }
 
 #[cfg(test)]

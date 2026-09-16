@@ -38,12 +38,14 @@ where
     type Error = E;
 
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
+        let node_name = std::any::type_name::<N>();
         let id = input.get_id();
         trace!(item_id = %id, "Checking idempotency status");
 
         // 1. Check if we should process this item
         match self.store.check_and_lock(&id).await? {
             IdempotencyStatus::Completed => {
+                metrics::counter!("pipeline_node_idempotency_skipped_total", "node" => node_name, "reason" => "completed").increment(1);
                 debug!(
                     item_id = %id, 
                     "Item already processed. Skipping execution."
@@ -51,6 +53,7 @@ where
                 return Ok(Vec::new()); 
             }
             IdempotencyStatus::InProgress => {
+                metrics::counter!("pipeline_node_idempotency_skipped_total", "node" => node_name, "reason" => "in_progress").increment(1);
                 // NOTE: This drops the item if another task is working on it.
                 // If strict consistency is required, you might want to implement a 
                 // retry loop/delay here to wait for the other task to finish.
@@ -61,6 +64,7 @@ where
                 return Ok(Vec::new()); 
             }
             IdempotencyStatus::New => {
+                metrics::counter!("pipeline_node_idempotency_passed_total", "node" => node_name).increment(1);
                 trace!(
                     item_id = %id, 
                     "Item is new. Idempotency lock acquired."
