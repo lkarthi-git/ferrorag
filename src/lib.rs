@@ -1,4 +1,5 @@
 pub mod pipeline;
+pub mod graph;
 pub mod source;
 mod dlq;
 pub mod node;

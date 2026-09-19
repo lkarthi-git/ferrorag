@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.92"
+futures = "0.3.34"
 metrics = "0.24.6"
 rand = "0.10.2"
 rayon = "1.12.0"
