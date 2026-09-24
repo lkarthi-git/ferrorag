@@ -6,6 +6,7 @@ mod rate_limit;
 mod chunk;
 mod idempotency;
 mod ordering;
+mod rollback;
 
 // 2. Re-export the structs so they are available at the `node::` level
 pub use retry::{RetryNode, ClassifyRetry};
@@ -16,6 +17,7 @@ pub use rate_limit::RateLimitNode;
 pub use chunk::ChunkNode;
 pub use idempotency::IdempotencyNode;
 pub use ordering::OrderingNode;
+pub use rollback::RollbackContext;
 // 3. Define the core traits here (since everything relies on them)
 use std::future::Future;
 

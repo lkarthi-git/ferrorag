@@ -25,6 +25,20 @@ pub struct Pipeline<T> {
     dlq_handle: Option<JoinHandle<()>>,
 }
 
+pub struct PipelineSource<T>{
+    receiver: mpsc::Receiver<T>,
+}
+
+impl<T: Send> Source for PipelineSource<T> {
+    type Item = T;
+    type Error = std::convert::Infallible;
+
+    async fn next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
+        Ok(self.receiver.recv().await)
+    }
+}
+
+
 impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     /// Creates a new Pipeline from a given source.
     /// 
@@ -37,6 +51,11 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
         Self::from_source_with_signal(source, ShutdownSignal::default())
     }
 
+    pub fn into_source(self) -> PipelineSource<T> {
+        PipelineSource {
+            receiver: self.receiver,
+        }
+    }
     /// Creates a new Pipeline from a given source with a shutdown signal.
     /// 
     /// This allows for graceful shutdown of the pipeline when a cancellation 
@@ -52,7 +71,18 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
 
         let dlq_handle = tokio::spawn(async move {
             info!("DLQ background task started");
-            let mut dlq: DLQueue = DLQueue::new().await;
+            let mut dlq = match DLQueue::new().await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(
+                        target: "pipeline::critical",
+                        severity = "CRITICAL",
+                        error = %e,
+                        "Failed to initialize DLQ. Errors will not be persisted."
+                    );
+                    return;
+                }
+            };
             
             while let Some(input) = recv_error.recv().await {
                 trace!(node = %input.node_name, "Writing error to DLQ");
@@ -217,7 +247,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
         node: impl Node<Input = T, Output = Vec<O>, Error = E> + Send + Sync + 'static
     ) -> Pipeline<O> 
     where 
-        O: Display + Send + Sync + 'static,
+        O: Debug + Send + Sync + 'static,
         E: Display + Send + 'static,
     {
         let (send, recv) = mpsc::channel(BUFFER_SIZE);
@@ -261,13 +291,13 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     }       
 
     /// Pipes the data concurrently through a processing node.
-    pub async fn pipe_concurrently<O,E>(
+    pub fn pipe_concurrently<O,E>(
         self, 
         node: impl Node<Input = T, Output = Vec<O>, Error = E> + Send + Sync + 'static,
         concurrency_limit: usize,
     ) -> Pipeline<O> 
     where 
-        O: Display + Send + Sync  + 'static,
+        O: Debug +Send + Sync  + 'static,
         E: Display + Send  + 'static,
     {
         assert!(
@@ -297,8 +327,8 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 while set.len() >= concurrency_limit {
                    if let Some(res) = set.join_next().await {
                         match res {
-                            Ok(continue_loop) => {
-                                if !continue_loop {
+                            Ok(is_fatal_error) => {
+                                if is_fatal_error {
                                     should_stop = true;
                                     break;
                                 }
@@ -348,7 +378,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
             
             // Wait for remaining tasks to complete
             while let Some(res) = set.join_next().await {
-                if let Ok(false) = res {
+                if let Ok(true) = res {
                     set.abort_all();
                     break;
                 }
@@ -541,20 +571,15 @@ mod tests {
 
         // Note: In a real test environment, DLQueue should ideally write to memory
         // or a temp file to avoid polluting the actual DLQ on disk.
-        let mut pipeline = Pipeline::from_source(source)
+        let results = Pipeline::from_source(source)
             .validate(|item| {
                 if item == "invalid_data" {
                     Err("Invalid data detected".to_string())
                 } else {
                     Ok(())
                 }
-            });
+            }).collect().await;
 
-        // Pull processed items directly off the receiver to verify
-        let mut results = Vec::new();
-        while let Some(item) = pipeline.receiver.recv().await {
-            results.push(item);
-        }
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], "valid_data");
@@ -566,12 +591,7 @@ mod tests {
             items: vec!["data1".to_string(), "error".to_string(), "data2".to_string()],
         };
 
-        let mut pipeline = Pipeline::from_source(source).pipe(MockNode);
-
-        let mut results = Vec::new();
-        while let Some(item) = pipeline.receiver.recv().await {
-            results.push(item);
-        }
+        let results = Pipeline::from_source(source).pipe(MockNode).collect().await;
 
         // We expect "data1" and "data2" to process successfully. 
         // "error" should drop and funnel to the DLQ internally.
