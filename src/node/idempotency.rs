@@ -1,6 +1,6 @@
 use crate::idempotency::{IdempotencyStore, IdempotencyStatus};
 use crate::node::Node;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace, warn,error};
 
 /// A trait for types that contain a unique, deterministic identifier 
 /// used for idempotency checks.
@@ -31,14 +31,18 @@ where
     S: IdempotencyStore + Send + Sync,
     I: Idempotent + Send + Sync,
     O: Default + Send,
-    E: From<S::Error> + Send, 
+    E: From<S::Error> + Send + From<std::io::Error>, 
 {
     type Input = I;
     type Output = Vec<O>;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "IdempotencyNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-        let node_name = std::any::type_name::<N>();
+        let node_name = self.name();
         let id = input.get_id();
         trace!(item_id = %id, "Checking idempotency status");
 
@@ -61,7 +65,10 @@ where
                     item_id = %id, 
                     "Item currently in progress elsewhere. Dropping to prevent duplication."
                 );
-                return Ok(Vec::new()); 
+                return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock, 
+                        "Item is currently in progress by another worker"
+                    ).into());
             }
             IdempotencyStatus::New => {
                 metrics::counter!("pipeline_node_idempotency_passed_total", "node" => node_name).increment(1);
@@ -86,7 +93,15 @@ where
                     // but assuming standard error traits are met.
                     "Execution failed. Releasing lock so item can be retried."
                 );
-                self.store.release_lock(&id).await?;
+                
+                if let Err(store_err) = self.store.release_lock(&id).await {
+                    error!(
+                        item_id = %id, 
+                        error = %store_err, 
+                        "Failed to release idempotency lock. Item may be stuck as InProgress."
+                    );
+                }
+
                 Err(error)
             }
         }

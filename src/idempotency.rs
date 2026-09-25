@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::fmt::Display;
 
 // The states our store needs to track
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +10,7 @@ pub enum IdempotencyStatus {
 }
 
 pub trait IdempotencyStore: Send + Sync + Clone {
-    type Error: Send;
+    type Error: Send + Display;
 
     // Checks the status and locks it if it's New
     fn check_and_lock(&self, id: &str) -> impl Future<Output = Result<IdempotencyStatus, Self::Error>> + Send;

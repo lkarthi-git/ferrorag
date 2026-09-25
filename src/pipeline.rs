@@ -2,8 +2,7 @@ use std::fmt::{Debug, Display};
 use tokio::sync::mpsc;
 use crate::source::Source;
 use crate::dlq::ErrorPayload;
-use crate::dlq::DLQueue;
-use tokio::io::AsyncWriteExt;
+use crate::dlq::DeadLetterQueue;
 use tokio::task::JoinSet;
 use crate::node::Node;
 use std::sync::Arc;
@@ -12,7 +11,14 @@ use tokio::task::JoinHandle;
 use crate::cancel::ShutdownSignal;
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
-const BUFFER_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionSummary {
+    /// The number of items that successfully made it to the end of the pipeline.
+    pub successful_items: usize,
+    /// The total number of errors caught and routed to the DLQ.
+    pub error_count: usize,
+}
 
 /// A concurrent data processing pipeline.
 /// 
@@ -22,8 +28,9 @@ const BUFFER_SIZE: usize = 100;
 pub struct Pipeline<T> {
     receiver: mpsc::Receiver<T>,
     error_sender: mpsc::Sender<ErrorPayload>,
-    dlq_handle: Option<JoinHandle<()>>,
+    dlq_handle: Option<JoinHandle<usize>>,
 }
+
 
 pub struct PipelineSource<T>{
     receiver: mpsc::Receiver<T>,
@@ -40,67 +47,81 @@ impl<T: Send> Source for PipelineSource<T> {
 
 
 impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
-    /// Creates a new Pipeline from a given source.
-    /// 
-    /// Initializes a background task for the Dead Letter Queue to handle errors.
-    pub fn from_source<S, E>(source: S) -> Self 
-    where 
-        S: Source<Item = T, Error = E> + Send + 'static,
-        E: Display + Send + 'static,
-    {
-        Self::from_source_with_signal(source, ShutdownSignal::default())
-    }
-
-    pub fn into_source(self) -> PipelineSource<T> {
+    pub fn into_source(mut self) -> PipelineSource<T> {
+        // drop(self.error_sender); // signal DLQ to stop
+        // if let Some(handle) = self.dlq_handle {
+        //     handle.await.ok(); // wait for flush
+        // }
+        let _ = self.dlq_handle.take();
         PipelineSource {
             receiver: self.receiver,
         }
     }
-    /// Creates a new Pipeline from a given source with a shutdown signal.
-    /// 
-    /// This allows for graceful shutdown of the pipeline when a cancellation 
-    /// token is triggered.
-    pub fn from_source_with_signal<S,E>(mut source: S, shutdown_signal: ShutdownSignal) -> Self 
+
+    /// Creates a new Pipeline from a given source.
+    ///
+    /// # DLQ Backpressure Warning
+    /// This pipeline bounds its internal channels using `buffer_size`. If the configured 
+    /// Dead Letter Queue (DLQ) writer is slow (e.g., slow disk or network I/O), and a 
+    /// massive spike of errors occurs, the error channel will fill up. 
+    ///
+    /// When the error channel is full, the active worker nodes will block while trying 
+    /// to send errors. This means a slow DLQ will actively throttle and pause your 
+    /// data ingestion pipeline. Size your `buffer_size` accordingly.
+    pub fn from_source<S, E>(source: S, dlq: impl DeadLetterQueue + Send + 'static,buffer_size:usize) -> Self 
     where 
         S: Source<Item = T, Error = E> + Send + 'static,
         E: Display + Send + 'static,
     {
-        let (send_raw, recv_raw) = mpsc::channel(BUFFER_SIZE);
-        let (send_error, mut recv_error) = mpsc::channel::<ErrorPayload>(BUFFER_SIZE);
+        Self::from_source_with_signal(source, dlq,ShutdownSignal::default(),buffer_size)
+    }
+
+
+    /// Creates a new Pipeline from a given source.
+    ///
+    /// # DLQ Backpressure Warning
+    /// This pipeline bounds its internal channels using `buffer_size`. If the configured 
+    /// Dead Letter Queue (DLQ) writer is slow (e.g., slow disk or network I/O), and a 
+    /// massive spike of errors occurs, the error channel will fill up. 
+    ///
+    /// When the error channel is full, the active worker nodes will block while trying 
+    /// to send errors. This means a slow DLQ will actively throttle and pause your 
+    /// data ingestion pipeline. Size your `buffer_size` accordingly.
+    pub fn from_source_with_signal<S,E>(mut source: S, mut dlq: impl DeadLetterQueue + Send + 'static, shutdown_signal: ShutdownSignal, buffer_size:usize) -> Self 
+    where 
+        S: Source<Item = T, Error = E> + Send + 'static,
+        E: Display + Send + 'static,
+    {
+        let (send_raw, recv_raw) = mpsc::channel(buffer_size);
+        let (send_error, mut recv_error) = mpsc::channel::<ErrorPayload>(buffer_size);
         let cancel_token_opt = shutdown_signal.into_token();
 
         let dlq_handle = tokio::spawn(async move {
             info!("DLQ background task started");
-            let mut dlq = match DLQueue::new().await {
-                Ok(d) => d,
-                Err(e) => {
-                    error!(
-                        target: "pipeline::critical",
-                        severity = "CRITICAL",
-                        error = %e,
-                        "Failed to initialize DLQ. Errors will not be persisted."
-                    );
-                    return;
-                }
-            };
-            
+            let mut error_count = 0;
+
             while let Some(input) = recv_error.recv().await {
+                error_count += 1;
                 trace!(node = %input.node_name, "Writing error to DLQ");
                 metrics::counter!("pipeline_dlq_events_total", "node" => input.node_name.clone()).increment(1);
                 let start = std::time::Instant::now();
-                dlq.write(input).await;
+                if let Err(e) = dlq.write(input).await {
+                    error!(error = %e, "Failed to write to DLQ. Disk full? Halting DLQ worker.");
+                    break; // Drops the channel, halting upstream nodes safely
+                }
                 metrics::histogram!("pipeline_dlq_write_duration_seconds").record(start.elapsed().as_secs_f64());
             }
             
-            if let Err(e) = dlq.writer.flush().await {
+            if let Err(e) = dlq.flush().await {
                 error!(error = %e, "Failed to flush DLQ writer during shutdown");
             }
             debug!("DLQ background task shutting down");
+            error_count
         }.instrument(info_span!("dlq_worker")));
 
         let send_error_clone = send_error.clone();
         tokio::spawn(async move {   
-            let source_name = std::any::type_name_of_val(&source).to_string();
+            let source_name = source.name();
             info!(source = %source_name, "Starting source polling task");
             
             loop {
@@ -108,6 +129,7 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                     tokio::select! {
                         _ = token.cancelled() => {
                             info!("Graceful shutdown initiated via cancellation token");
+                            source.close().await.ok();
                             break; 
                         },
                         res = source.next() => {
@@ -169,19 +191,20 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                         severity = "CRITICAL",
                         "The background logging task died. Halting pipeline to prevent data loss."
                     );
+                    return true
                 }
-                false
+                true
             }
         }
     }
 
     /// Adds a validation step to the pipeline.
-    pub fn validate<F, E>(self, validator: F) -> Pipeline<T>
+    pub fn validate<F, E>(self, validator: F,buffer_size:usize) -> Pipeline<T>
     where
         F: Fn(&T) -> Result<(), E> + Send + Sync + 'static,
         E: Display + Send + 'static,
     {
-        let (send, recv) = mpsc::channel(BUFFER_SIZE);
+        let (send, recv) = mpsc::channel(buffer_size);
         let send_error_clone = self.error_sender.clone();
 
         tokio::spawn(async move {
@@ -244,18 +267,19 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     /// Pipes the data sequentially through a processing node.
     pub fn pipe<O,E>(
         self, 
-        node: impl Node<Input = T, Output = Vec<O>, Error = E> + Send + Sync + 'static
+        node: impl Node<Input = T, Output = Vec<O>, Error = E> + Send + Sync + 'static,
+        buffer_size:usize
     ) -> Pipeline<O> 
     where 
         O: Debug + Send + Sync + 'static,
         E: Display + Send + 'static,
     {
-        let (send, recv) = mpsc::channel(BUFFER_SIZE);
+        let (send, recv) = mpsc::channel(buffer_size);
         let send_error_clone = self.error_sender.clone();
         
         tokio::spawn(async move {
             let mut receiver = self.receiver;
-            let node_name = std::any::type_name_of_val(&node);
+            let node_name = node.name();
             
             while let Some(input) = receiver.recv().await {
                 metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
@@ -291,45 +315,78 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     }       
 
     /// Pipes the data concurrently through a processing node.
-    pub fn pipe_concurrently<O,E>(
+   pub fn pipe_concurrently<O, E>(
         self, 
         node: impl Node<Input = T, Output = Vec<O>, Error = E> + Send + Sync + 'static,
         concurrency_limit: usize,
+        buffer_size:usize
     ) -> Pipeline<O> 
     where 
         O: Debug +Send + Sync  + 'static,
         E: Display + Send  + 'static,
     {
-        assert!(
-                    concurrency_limit <= BUFFER_SIZE, 
-                    "Concurrency limit ({}) must be less than or equal to BUFFER_SIZE ({})",
-                    concurrency_limit,
-                    BUFFER_SIZE
-        );        
-        let (send, recv) = mpsc::channel(BUFFER_SIZE);
+ 
+        let (send, recv) = mpsc::channel(buffer_size);
         let send_error_clone = self.error_sender.clone();
         
         tokio::spawn(async move {
             let mut receiver = self.receiver;
-            let node_name = std::any::type_name_of_val(&node);
-            let shared_node= Arc::new(node);
+            let node_name = node.name();
+            let shared_node = Arc::new(node);
             let mut set: JoinSet<bool> = JoinSet::new();
+            let mut is_upstream_closed = false;
+            while !is_upstream_closed || !set.is_empty()  {
+                tokio::select! {
+                    // Branch 1: Pull new items ONLY if we have capacity and upstream is open
+                    res = receiver.recv(), if !is_upstream_closed && set.len() < concurrency_limit => {
+                        match res {
+                            Some(input) => {
+                                metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
+                                
+                                if send.is_closed() {
+                                    warn!("Downstream channel closed, aborting concurrent tasks");
+                                    set.abort_all();
+                                    break; 
+                                }
 
-            while let Some(input) = receiver.recv().await {
-                metrics::counter!("pipeline_node_received_total", "node" => node_name).increment(1);
-                if send.is_closed() {
-                    warn!("Downstream channel closed, aborting concurrent tasks");
-                    set.abort_all();
-                    break; 
-                }
+                                let send_clone = send.clone();
+                                let error_send_clone = send_error_clone.clone();
+                                let node_ref = Arc::clone(&shared_node);
+                                
+                                set.spawn(async move {
+                                    let span = info_span!("node_execute_concurrent", node.name = node_name);
+                                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).increment(1.0);
+                                    let start = std::time::Instant::now();
+                                    
+                                    let result = async {
+                                        let output: Result<Vec<O>, E> = node_ref.execute(&input)
+                                            .await
+                                            .inspect_err(|e| error!(error = %e, "Concurrent node execution failed"));
+                                            
+                                        metrics::histogram!("pipeline_node_execution_duration_seconds", "node" => node_name).record(start.elapsed().as_secs_f64());
+                                        Self::handle_node_result(output, &send_clone, &error_send_clone, node_name, Some(&input)).await
+                                    }
+                                    .instrument(span)
+                                    .await;
+                                    
+                                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).decrement(1.0);
+                                    result
+                                });
+                            }
+                            None => {
+                                // Upstream is exhausted. Mark it closed so this branch stops polling.
+                                is_upstream_closed = true;
+                            }
+                        }
+                    }
 
-                let mut should_stop = false;
-                while set.len() >= concurrency_limit {
-                   if let Some(res) = set.join_next().await {
+                    // Branch 2: Actively reap completed tasks (even when upstream is paused or closed)
+                    Some(res) = set.join_next() => {
                         match res {
                             Ok(is_fatal_error) => {
                                 if is_fatal_error {
-                                    should_stop = true;
+                                    warn!("Fatal error downstream, aborting concurrent node.");
+                                    set.abort_all();
                                     break;
                                 }
                             }
@@ -340,50 +397,27 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                                         severity = "CRITICAL", 
                                         "A concurrent pipeline task panicked!"
                                     );
+                                    // Send to DLQ
+                                    let payload = ErrorPayload {
+                                        node_name: node_name.to_string(),
+                                        error_message: "Task panicked".to_string(),
+                                        raw_data: "unknown — lost to panic".to_string(),
+                                    };
+                                    send_error_clone.send(payload).await.ok();
+                                    // Decrement gauge since task didn't get to do it
+                                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).decrement(1.0);
+                                    set.abort_all();
+                                    break;
                                 } else if error.is_cancelled() {
                                     warn!("Pipeline task was cancelled");
+                                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).decrement(1.0);
                                 }
                             }
                         }
-                   }
-                }
-
-                if should_stop {
-                    warn!("A critical error occurred; aborting all concurrent tasks");
-                    set.abort_all();
-                    break;
-                }
-
-                let send_clone = send.clone();
-                let error_send_clone: mpsc::Sender<ErrorPayload> = send_error_clone.clone();
-                let node_ref = Arc::clone(&shared_node);
-                
-                set.spawn(async move {
-                    let span = info_span!("node_execute_concurrent", node.name = node_name);
-                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).increment(1.0);
-                    let start = std::time::Instant::now();
-                    let result = async {
-                        let output: Result<Vec<O>, E> = node_ref.execute(&input)
-                            .await
-                            .inspect_err(|e| error!(error = %e, "Concurrent node execution failed"));
-                        metrics::histogram!("pipeline_node_execution_duration_seconds", "node" => node_name).record(start.elapsed().as_secs_f64());
-                        Self::handle_node_result(output, &send_clone, &error_send_clone, node_name, Some(&input)).await
                     }
-                    .instrument(span)
-                    .await;
-                    metrics::gauge!("pipeline_concurrent_tasks_active", "node" => node_name).decrement(1.0);
-                    result
-                });
-            }
-            
-            // Wait for remaining tasks to complete
-            while let Some(res) = set.join_next().await {
-                if let Ok(true) = res {
-                    set.abort_all();
-                    break;
                 }
             }
-            
+
             info!(node = %node_name, "Flushing concurrent node");
             let flush_output = shared_node.flush();
             Self::handle_node_result(flush_output, &send, &send_error_clone, node_name, None).await;
@@ -445,18 +479,19 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
     }
 
     /// Private helper to handle the graceful shutdown of the DLQ
-    async fn close_and_wait(mut self) {
+    async fn close_and_wait(mut self) -> usize {
         // Drop the sender to close the DLQ channel
         drop(self.error_sender);
-        
+        let mut final_error_count = 0;
         if let Some(handle) = self.dlq_handle.take() {
             // Configure a grace period for the DLQ to flush its final logs.
             // You can also make this a configurable field on the Pipeline struct if desired.
             let grace_period = Duration::from_secs(10);
 
             match tokio::time::timeout(grace_period, handle).await {
-                Ok(Ok(_)) => {
+                Ok(Ok(errors)) => {
                     info!("Pipeline shutdown gracefully. All errors logged to DLQ.");
+                    final_error_count = errors;
                 }
                 Ok(Err(e)) => {
                     error!(
@@ -478,50 +513,59 @@ impl<T: Debug + Send + Sync + 'static> Pipeline<T> {
                 }
             }
         }
+        final_error_count
     }
 
     /// 1. DRAIN / EXECUTE
-    pub async fn execute(mut self) {
+    pub async fn execute(mut self) -> ExecutionSummary {
         info!("Executing pipeline as drain...");
+        let mut successful_items = 0;
+
         while let Some(_) = self.receiver.recv().await {
             metrics::counter!("pipeline_completed_total").increment(1);
+            successful_items += 1;
         }
         
-        self.close_and_wait().await;
+        let error_count = self.close_and_wait().await;
+        ExecutionSummary { successful_items, error_count }
     }
 
     /// 2. COLLECT
-    pub async fn collect(mut self) -> Vec<T> {
+    pub async fn collect(mut self) -> (Vec<T>, ExecutionSummary) {
         info!("Executing pipeline as collect...");
         let mut results = Vec::new();
         while let Some(item) = self.receiver.recv().await {
             metrics::counter!("pipeline_completed_total").increment(1);
             results.push(item);
         }
-        
-        self.close_and_wait().await;
-        results
+        let successful_items = results.len();
+        let error_count = self.close_and_wait().await;
+        (results, ExecutionSummary { successful_items, error_count })
     }
 
     /// 3. FOR EACH
-    pub async fn for_each<F>(mut self, mut action: F)
+    pub async fn for_each<F>(mut self, mut action: F) -> ExecutionSummary
     where
         F: FnMut(T),
     {
         info!("Executing pipeline as for_each...");
+        let mut successful_items = 0;
+
         while let Some(item) = self.receiver.recv().await {
             metrics::counter!("pipeline_completed_total").increment(1);
             action(item);
+            successful_items += 1;
         }
         
-        self.close_and_wait().await;
+        let error_count = self.close_and_wait().await;
+        ExecutionSummary { successful_items, error_count }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::dlq::NoOpDLQ;
     // --- Mock Implementations ---
 
     struct MockSource {
@@ -569,16 +613,18 @@ mod tests {
             items: vec!["valid_data".to_string(), "invalid_data".to_string()],
         };
 
+        let dlq = NoOpDLQ;
+
         // Note: In a real test environment, DLQueue should ideally write to memory
         // or a temp file to avoid polluting the actual DLQ on disk.
-        let results = Pipeline::from_source(source)
+        let (results,_) = Pipeline::from_source(source,dlq,100)
             .validate(|item| {
                 if item == "invalid_data" {
                     Err("Invalid data detected".to_string())
                 } else {
                     Ok(())
                 }
-            }).collect().await;
+            },100).collect().await;
 
 
         assert_eq!(results.len(), 1);
@@ -591,7 +637,9 @@ mod tests {
             items: vec!["data1".to_string(), "error".to_string(), "data2".to_string()],
         };
 
-        let results = Pipeline::from_source(source).pipe(MockNode).collect().await;
+        let dlq = NoOpDLQ;
+
+        let (results,_) = Pipeline::from_source(source,dlq,100).pipe(MockNode,100).collect().await;
 
         // We expect "data1" and "data2" to process successfully. 
         // "error" should drop and funnel to the DLQ internally.

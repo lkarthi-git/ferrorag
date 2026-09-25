@@ -5,9 +5,19 @@ use tracing::{error, trace};
 
 /// A node wrapper that limits the number of concurrent executions.
 ///
-/// This is useful for preventing downstream services, databases, or rate-limited APIs 
-/// from being overwhelmed by too many simultaneous requests. It uses a Tokio `Semaphore` 
-/// to manage execution permits.
+/// This uses a Tokio `Semaphore` to manage execution permits, protecting downstream 
+/// services or databases from being overwhelmed.
+///
+/// # ⚠️ Composition Guidelines
+/// When composing this node with a `RetryNode`, **always place the `ConcurrencyLimitNode` 
+/// INSIDE the `RetryNode`**.
+///
+/// - **Good:** `RetryNode::new(ConcurrencyLimitNode::new(Node))`
+/// - **Bad:** `ConcurrencyLimitNode::new(RetryNode::new(Node))`
+///
+/// If placed on the outside, a failing request will hold the concurrency permit hostage 
+/// while it sleeps during its retry backoff. If enough requests fail, the entire 
+/// pipeline will deadlock until the sleep timers expire.
 pub struct ConcurrencyLimitNode<N> {
     /// The underlying node to execute once a permit is acquired.
     pub node: N,
@@ -44,8 +54,12 @@ where
     type Output = O;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "ConcurrencyLimitNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-        let node_name = std::any::type_name::<N>();
+        let node_name = self.name();
         // Trace-level logging helps diagnose pipeline bottlenecks locally
         // without flooding production I/O.
         trace!(

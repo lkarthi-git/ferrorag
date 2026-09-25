@@ -6,6 +6,16 @@ use tracing::{debug, trace};
 ///
 /// This is highly useful before nodes that perform I/O operations, such as 
 /// bulk database inserts or batch API requests, reducing the number of calls.
+///
+/// # ⚡ Performance Warning: Memory Cloning
+/// Because the pipeline passes data by reference (`&T`), this node must take 
+/// ownership of the items to batch them by calling `input.clone()`. 
+/// 
+/// If your data payload `T` is large (e.g., heavy JSON structs, large strings, 
+/// byte buffers), this will cause significant memory allocation overhead. It is 
+/// **highly recommended** to wrap large payloads in `std::sync::Arc<T>` or 
+/// `bytes::Bytes` before pushing them into the pipeline to turn deep copies 
+/// into cheap reference-count increments.
 pub struct ChunkNode<T> {
     batch_size: usize,
     buffer: Mutex<Vec<T>>,
@@ -30,8 +40,12 @@ impl<T: Clone + Send + Sync> Node for ChunkNode<T> {
     type Output = Vec<Vec<T>>;
     type Error = std::io::Error;
 
+    fn name(&self) -> &'static str {
+        "ChunkNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-            let node_name = std::any::type_name::<Self>();
+            let node_name = self.name();
             
             let chunk_to_emit = {
                 let mut buf = self.buffer.lock().unwrap();
@@ -74,7 +88,7 @@ impl<T: Clone + Send + Sync> Node for ChunkNode<T> {
         }
 
         fn flush(&self) -> Result<Self::Output, Self::Error> {
-            let node_name = std::any::type_name::<Self>();
+            let node_name = self.name();
             
             let remainder = {
                 let mut buf = self.buffer.lock().unwrap();

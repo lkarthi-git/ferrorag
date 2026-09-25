@@ -62,14 +62,18 @@ where
     type Output = O;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "RateLimitNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-            let node_name = std::any::type_name::<N>();
+            let node_name = self.name();
 
             let wait_time = {
                 let mut state = self.state.lock().unwrap(); // Using std::sync::Mutex
                 
                 let now = Instant::now();
-                let elapsed = now.duration_since(state.last_updated).as_secs_f64();
+                let elapsed = now.saturating_duration_since(state.last_updated).as_secs_f64();
                 let regeneration_rate = self.tokens_per_minute / 60.0;
                 
                 let new_tokens = state.tokens + (elapsed * regeneration_rate);

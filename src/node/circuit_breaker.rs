@@ -50,6 +50,7 @@ impl<N> CircuitBreakerNode<N> {
             reset_after,
         }
     }
+
 }
 
 impl<N, I, O, E> Node for CircuitBreakerNode<N>
@@ -63,8 +64,12 @@ where
     type Output = O;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "CircuitBreakerNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-       let node_name = std::any::type_name::<N>();
+       let node_name = self.name();
        let probe_id = {
             // std::sync::Mutex doesn't need .await
             let mut state = self.state.lock().unwrap(); 

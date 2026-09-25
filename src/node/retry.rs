@@ -60,9 +60,13 @@ where
     type Input = I;
     type Output = O;
     type Error = E;
+
+    fn name(&self) -> &'static str {
+        "RetryNode"
+    }
     
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-            let node_name = std::any::type_name::<N>();
+            let node_name = self.name();
             let mut remaining_retries = self.retry_count;
             loop {
                 // Calculate this before the match so it represents the CURRENT attempt

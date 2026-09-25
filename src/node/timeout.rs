@@ -2,11 +2,15 @@ use crate::node::Node;
 use std::time::Duration;
 use tracing::{warn};
 
-/// A node wrapper that enforces a strict time limit on the execution of the inner node.
+
+/// A node wrapper that enforces a strict execution time limit on the inner node.
 ///
-/// If the inner node takes longer than the configured `timeout` duration to complete,
-/// the future is canceled (aborted) and a `TimedOut` error is immediately returned.
+/// # ⚠️ Composition Guidelines
+/// When composing this node with a `RetryNode`, the order drastically changes the behavior:
 ///
+/// - **`RetryNode::new(TimeoutNode::new(Node))`**: The timeout applies to **each individual attempt**. (Usually what you want).
+/// - **`TimeoutNode::new(RetryNode::new(Node))`**: The timeout applies to the **entire retry loop** combined, including backoff sleep times.
+/// 
 /// # ⚠️ Cancellation Safety Warning
 /// Because this node relies on dropping the underlying future when the timeout elapses, 
 /// the inner node **must be cancellation safe**. If the inner node performs partial I/O 
@@ -43,8 +47,12 @@ where
     type Output = O;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "TimeoutNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-        let node_name = std::any::type_name::<N>();
+        let node_name = self.name();
         // tokio::time::timeout wraps the future and cancels it if the duration elapses.
         match tokio::time::timeout(self.timeout, self.node.execute(input)).await {
             Ok(inner_result) => inner_result,

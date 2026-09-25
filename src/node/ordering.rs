@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use crate::node::Node;
+use std::fmt::Display;
 use tracing::{debug, trace, warn};
+
 
 /// Trait to extract a strictly monotonically increasing sequence ID from an input.
 /// This is required for the `OrderingNode` to reconstruct the original order.
@@ -20,8 +22,21 @@ struct OrderState<O> {
 /// A middleware node that restores sequential ordering in a concurrent pipeline.
 ///
 /// When data is processed concurrently (e.g., via `pipe_concurrently`), the output 
-/// order is typically scrambled based on which tasks finish first. The `OrderingNode` 
-/// buffers out-of-order results and emits them strictly in the order of their sequence IDs.
+/// order is typically scrambled. This node buffers out-of-order results and emits 
+/// them strictly in the order of their sequence IDs.
+///
+/// # ⚠️ Critical Warning: Gapless Sequence Requirement
+/// This node fundamentally relies on strictly contiguous sequence IDs (`next_expected_id += 1`).
+/// **You must not place filtering nodes (e.g., a validator that drops items) upstream 
+/// of this node.** If an item is dropped before reaching this node, the sequence 
+/// will break, and this node will buffer all subsequent items indefinitely until 
+/// the application crashes with an Out-Of-Memory (OOM) error.
+/// 
+/// # Latency Note on Errors
+/// If an inner node execution fails, a tombstone is inserted to prevent deadlocks. 
+/// However, due to Rust's `Result` signature, already-buffered successful items cannot 
+/// be yielded simultaneously with the error. They will be released milliseconds later 
+/// when the *next* successful item passes through. This causes no data loss.
 pub struct OrderingNode<N, O> {
     pub inner_node: N,
     state: Mutex<OrderState<O>>,
@@ -48,14 +63,18 @@ where
     N: Node<Input = I, Output = Vec<O>, Error = E> + Send + Sync,
     I: Sequenced + Send + Sync + 'static,
     O: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    E: Send + Display + Sync + 'static,
 {
     type Input = I;
     type Output = Vec<O>;
     type Error = E;
 
+    fn name(&self) -> &'static str {
+        "OrderingNode"
+    }
+
     async fn execute(&self, input: &Self::Input) -> Result<Self::Output, Self::Error> {
-        let node_name = std::any::type_name::<N>();
+        let node_name = self.name();
         let seq_id = input.get_sequence_id();
         trace!(seq_id = seq_id, "Executing ordered item");
 
@@ -64,7 +83,7 @@ where
                 let mut state = self.state.lock().unwrap();
                 
                 // Buffer the current result
-                state.buffer.insert(seq_id, output);
+                state.buffer.entry(seq_id).or_default().extend(output);
 
                 let mut results_to_emit = Vec::new();
                 let mut ids_emitted = 0;
@@ -139,15 +158,21 @@ where
             );
         }
 
+        match self.inner_node.flush() {
+            Ok(inner_output) => {
+                results_to_emit.extend(inner_output);
+            }
+            Err(e) => {
+                warn!(error = %e, "Inner node flush failed, but preserving already buffered items");
+            }
+        }
+
         // Force-drain everything remaining in the buffer, ignoring sequence gaps
         while let Some((_, ready_output)) = state.buffer.pop_first() {
             results_to_emit.extend(ready_output);
         }
 
-        let mut final_output = self.inner_node.flush()?;
-        final_output.extend(results_to_emit);
-
-        Ok(final_output)
+        Ok(results_to_emit)
     }
 }
 
