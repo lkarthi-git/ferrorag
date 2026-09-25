@@ -253,10 +253,10 @@ mod tests {
         let node = IdempotencyNode::new(MockNode, store.clone());
         let input = TestInput { id: "item_4".into(), should_fail: false };
 
-        let result = node.execute(&input).await.unwrap();
+        let result = node.execute(&input).await;
 
         // Should drop the item (return empty vec)
-        assert!(result.is_empty());
+        assert!(result.is_err());
         // Should remain InProgress
         assert_eq!(store.get_status("item_4"), Some(IdempotencyStatus::InProgress));
     }

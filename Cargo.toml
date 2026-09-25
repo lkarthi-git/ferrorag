@@ -1,9 +1,12 @@
-[package]
-name = "ferrorag"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2" # Required for modern Rust workspaces
+members = [
+    "crates/core-engine", "crates/rag-pipeline",
+]
 
-[dependencies]
+# OPTIONAL BUT HIGHLY RECOMMENDED: Workspace Dependencies
+# Define shared dependencies here so all crates use the exact same versions
+[workspace.dependencies]
 async-trait = "0.1.92"
 futures = "0.3.34"
 metrics = "0.24.6"

@@ -93,7 +93,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrorag"
+name = "ferro-core-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "metrics",
+ "rand",
+ "rayon",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ferro-rag-pipeline"
 version = "0.1.0"
 dependencies = [
  "async-trait",
