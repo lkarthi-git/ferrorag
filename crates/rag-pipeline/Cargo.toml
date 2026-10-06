@@ -1,10 +1,11 @@
 [package]
-name = "ferro-rag-pipeline"
+name = "ferro-rag"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-trait = { workspace = true }
+ferro-core = { path = "../core" }
+async-trait.workspace = true
 futures = { workspace = true }
 metrics = { workspace = true }
 rand = { workspace = true }
@@ -12,3 +13,9 @@ rayon = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+bytes = "1.12.1"
+thiserror = "2.0.21"
+pdf-inspector = "1.25.2"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+metrics-exporter-prometheus = "0.18.3"
+tokenizers = {version = "0.23.2", features = ["http"] }

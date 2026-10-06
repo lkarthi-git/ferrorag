@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2" # Required for modern Rust workspaces
 members = [
-    "crates/core-engine", "crates/rag-pipeline",
+    "crates/core", "crates/rag-pipeline",
 ]
 
 # OPTIONAL BUT HIGHLY RECOMMENDED: Workspace Dependencies
