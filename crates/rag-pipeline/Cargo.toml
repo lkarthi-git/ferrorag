@@ -19,3 +19,20 @@ pdf-inspector = "1.25.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 metrics-exporter-prometheus = "0.18.3"
 tokenizers = {version = "0.23.2", features = ["http"] }
+fastembed = "7.1.1"
+
+ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching"] }
+sha2 = "0.11.1"
+lancedb = { version = "0.39.0", features = ["remote"] }
+uuid = "1.28.0"
+
+# macOS-specific overrides: Use the correct compile feature 'coreml'
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.13", features = [] }
+
+# Linux / Windows specific overrides: Use 'cuda
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }

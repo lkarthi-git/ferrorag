@@ -1,6 +1,8 @@
 use crate::idempotency::{IdempotencyStore, IdempotencyStatus};
 use crate::node::Node;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace, warn,error};
+
 
 /// A trait for types that contain a unique, deterministic identifier 
 /// used for idempotency checks.
@@ -45,7 +47,10 @@ where
         let node_name = self.name();
         let id = input.get_id();
         trace!(item_id = %id, "Checking idempotency status");
-
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System clock was set backwards")
+            .as_secs();
         // 1. Check if we should process this item
         match self.store.check_and_lock(&id).await? {
             IdempotencyStatus::Completed => {
@@ -56,19 +61,36 @@ where
                 );
                 return Ok(Vec::new()); 
             }
-            IdempotencyStatus::InProgress => {
-                metrics::counter!("pipeline_node_idempotency_skipped_total", "node" => node_name, "reason" => "in_progress").increment(1);
+            IdempotencyStatus::InProgress { expires_at } => {
                 // NOTE: This drops the item if another task is working on it.
                 // If strict consistency is required, you might want to implement a 
                 // retry loop/delay here to wait for the other task to finish.
-                warn!(
-                    item_id = %id, 
-                    "Item currently in progress elsewhere. Dropping to prevent duplication."
-                );
-                return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock, 
-                        "Item is currently in progress by another worker"
-                    ).into());
+                if now < expires_at {
+                        // ACTIVE LOCK: Someone else is currently working on this.
+                        metrics::counter!("pipeline_node_idempotency_skipped_total", "node" => node_name, "reason" => "in_progress").increment(1);
+                        warn!(
+                            item_id = %id, 
+                            "Item currently in progress elsewhere. Dropping to prevent duplication."
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock, 
+                            "Item is currently in progress by another worker"
+                        ).into());
+                    } else {
+                        // STALE LOCK: The previous worker died. 
+                        metrics::counter!("pipeline_node_idempotency_passed_total", "node" => node_name, "reason" => "stale_lock_stolen").increment(1);
+                        trace!(
+                            item_id = %id, 
+                            "Stale lock detected. Stealing idempotency lock."
+                        );
+                        
+                        // CRITICAL: You must update the database to claim the lock so other threads don't also steal it!
+                        // You need a method on your store like `steal_lock(&id)` to reset the expiration.
+                        self.store.steal_lock(&id).await?; 
+                        
+                        // After stealing, we naturally fall out of the match statement 
+                        // and proceed down to self.inner_node.execute(input).await
+                    }
             }
             IdempotencyStatus::New => {
                 metrics::counter!("pipeline_node_idempotency_passed_total", "node" => node_name).increment(1);
@@ -114,11 +136,13 @@ where
 
 #[cfg(test)]
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::collections::HashMap;
     use std::io;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // --- Mock Setup ---
 
@@ -146,12 +170,15 @@ mod tests {
                 Ok(vec![format!("Processed {}", input.id)])
             }
         }
+        
+        fn name(&self) -> &'static str {
+            "MockNode"
+        }
     }
 
     /// An in-memory mock store to verify the node interacts with the store correctly.
     #[derive(Clone)]
     struct MockStore {
-        // Shared state for the store mapping ID -> Status
         state: Arc<Mutex<HashMap<String, IdempotencyStatus>>>,
     }
 
@@ -162,19 +189,19 @@ mod tests {
             }
         }
         
-        /// Helper to seed the store with a specific status before a test
         fn seed(&self, id: &str, status: IdempotencyStatus) {
             self.state.lock().unwrap().insert(id.to_string(), status);
         }
         
-        /// Helper to verify the final status of an item
         fn get_status(&self, id: &str) -> Option<IdempotencyStatus> {
             self.state.lock().unwrap().get(id).copied()
         }
+        
+        fn current_time_secs() -> u64 {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        }
     }
 
-    // You might need to adjust this depending on if your actual trait uses `#[async_trait]` 
-    // or native async fns.
     impl IdempotencyStore for MockStore {
         type Error = io::Error;
 
@@ -182,9 +209,10 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             let current = state.get(id).copied().unwrap_or(IdempotencyStatus::New);
             
-            // If it's new, we lock it immediately
+            // If it's new, we lock it immediately with a 15-minute TTL
             if matches!(current, IdempotencyStatus::New) {
-                state.insert(id.to_string(), IdempotencyStatus::InProgress);
+                let expires_at = Self::current_time_secs() + 900;
+                state.insert(id.to_string(), IdempotencyStatus::InProgress { expires_at });
             }
             Ok(current)
         }
@@ -197,8 +225,15 @@ mod tests {
 
         async fn release_lock(&self, id: &str) -> Result<(), Self::Error> {
             let mut state = self.state.lock().unwrap();
-            // In a real system, you might delete the key or mark it as New
             state.insert(id.to_string(), IdempotencyStatus::New);
+            Ok(())
+        }
+        
+        // Added the steal_lock method required to fix the fall-through bug
+        async fn steal_lock(&self, id: &str) -> Result<(), Self::Error> {
+            let mut state = self.state.lock().unwrap();
+            let expires_at = Self::current_time_secs() + 900;
+            state.insert(id.to_string(), IdempotencyStatus::InProgress { expires_at });
             Ok(())
         }
     }
@@ -226,7 +261,6 @@ mod tests {
         let result = node.execute(&input).await;
 
         assert!(result.is_err());
-        // Since it failed, the lock should have been released (set back to New)
         assert_eq!(store.get_status("item_2"), Some(IdempotencyStatus::New));
     }
 
@@ -240,24 +274,46 @@ mod tests {
 
         let result = node.execute(&input).await.unwrap();
 
-        // Should return empty vec, NOT "Processed item_3"
         assert!(result.is_empty());
         assert_eq!(store.get_status("item_3"), Some(IdempotencyStatus::Completed));
     }
 
     #[tokio::test]
-    async fn test_in_progress_item_is_skipped() {
+    async fn test_active_in_progress_item_returns_would_block() {
         let store = MockStore::new();
-        store.seed("item_4", IdempotencyStatus::InProgress);
+        // Seed an ACTIVE lock (expires 1 hour in the future)
+        let future_time = MockStore::current_time_secs() + 3600;
+        store.seed("item_4", IdempotencyStatus::InProgress { expires_at: future_time });
         
         let node = IdempotencyNode::new(MockNode, store.clone());
         let input = TestInput { id: "item_4".into(), should_fail: false };
 
         let result = node.execute(&input).await;
 
-        // Should drop the item (return empty vec)
+        // Should return a WouldBlock error to prevent duplicate execution
         assert!(result.is_err());
-        // Should remain InProgress
-        assert_eq!(store.get_status("item_4"), Some(IdempotencyStatus::InProgress));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        
+        // Should remain InProgress with the original future time
+        assert_eq!(store.get_status("item_4"), Some(IdempotencyStatus::InProgress { expires_at: future_time }));
+    }
+
+    #[tokio::test]
+    async fn test_stale_in_progress_item_steals_lock_and_processes() {
+        let store = MockStore::new();
+        // Seed a STALE lock (expired 1 hour ago)
+        let past_time = MockStore::current_time_secs() - 3600;
+        store.seed("item_5", IdempotencyStatus::InProgress { expires_at: past_time });
+        
+        let node = IdempotencyNode::new(MockNode, store.clone());
+        let input = TestInput { id: "item_5".into(), should_fail: false };
+
+        let result = node.execute(&input).await.unwrap();
+
+        // Because it was stale, it should steal the lock, process successfully, and return the data
+        assert_eq!(result, vec!["Processed item_5"]);
+        
+        // It should finally be marked as completed
+        assert_eq!(store.get_status("item_5"), Some(IdempotencyStatus::Completed));
     }
 }

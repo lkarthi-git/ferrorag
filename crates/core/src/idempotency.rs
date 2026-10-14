@@ -5,7 +5,7 @@ use std::fmt::Display;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdempotencyStatus {
     New,        
-    InProgress, 
+    InProgress { expires_at: u64 }, 
     Completed,   
 }
 
@@ -20,4 +20,6 @@ pub trait IdempotencyStore: Send + Sync + Clone {
     
     // Deletes the ID so it can be retried later
     fn release_lock(&self, id: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn steal_lock(&self, id: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

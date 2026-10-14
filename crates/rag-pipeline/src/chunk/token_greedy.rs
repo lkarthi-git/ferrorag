@@ -53,7 +53,7 @@ impl ChunkerStrategy for TokenGreedyStrategy {
                     current_pages.dedup();
                     all_chunks.push(Chunk {
                         document_uri: Arc::clone(&doc.uri),
-                        text: current_chunk_text.trim().to_string(),
+                        text: Arc::new(current_chunk_text.trim().to_string()),
                         token_count: current_chunk_tokens,
                         pages: std::mem::take(&mut current_pages),
                     });
@@ -73,7 +73,7 @@ impl ChunkerStrategy for TokenGreedyStrategy {
                         if let Ok(decoded_text) = self.tokenizer.decode(token_slice, false) {
                             all_chunks.push(Chunk {
                                 document_uri: Arc::clone(&doc.uri),
-                                text: decoded_text.trim().to_string(),
+                                text: Arc::new(decoded_text.trim().to_string()),
                                 token_count: token_slice.len(),
                                 pages: page_number.map(|p| vec![p]).unwrap_or_default(),
                             });
@@ -99,7 +99,7 @@ impl ChunkerStrategy for TokenGreedyStrategy {
                 current_pages.dedup();
                 all_chunks.push(Chunk {
                     document_uri: Arc::clone(&doc.uri),
-                    text: current_chunk_text.trim().to_string(),
+                    text: Arc::new(current_chunk_text.trim().to_string()),
                     token_count: current_chunk_tokens,
                     pages: current_pages,
                 });

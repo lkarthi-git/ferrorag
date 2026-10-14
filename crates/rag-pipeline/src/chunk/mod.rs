@@ -6,14 +6,21 @@ use crate::document::{Document, DocumentError};
 
 
 pub mod token_greedy;
-
+pub mod structural;
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub document_uri: Arc<str>,
-    pub text: String,
+    pub text: Arc<String>,
     pub token_count: usize,
     pub pages: Vec<u32>,
 }
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedChunk {
+    pub chunk: Chunk,
+    pub vector: Vec<f32>,
+}
+
 
 
 #[async_trait]

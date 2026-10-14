@@ -21,11 +21,12 @@ pub enum DocumentError {
 }
 
 // 2. Data Structures (Derive Debug and Clone for framework usability)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone,Default)]
 pub struct Document {
     pub uri: Arc<str>, 
     pub metadata: Arc<DocumentMetadata>,
-    pub elements: Vec<Element>, 
+    pub elements: Vec<Element>,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
