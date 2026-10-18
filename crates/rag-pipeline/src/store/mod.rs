@@ -1,124 +1,124 @@
-use std::sync::Arc;
-use futures::StreamExt;
-use lancedb::{connect, Connection};
+use std::error::Error;
+use crate::chunk::EmbeddedChunk;
+use std::collections::HashMap;
 
-// 1. IMPORT FROM LANCEDB'S RE-EXPORTS to guarantee version compatibility!
-use lancedb::arrow::arrow_array::builder::{FixedSizeListBuilder, PrimitiveBuilder, StringBuilder};
-use lancedb::arrow::arrow_array::types::Float32Type;
-use lancedb::arrow::arrow_array::RecordBatch;
-use lancedb::arrow::arrow_schema::{DataType, Field, Schema as ArrowSchema};
+#[cfg(feature = "lance-db")]
+pub mod lancedb;
 
-use lancedb::query::{ExecutableQuery, QueryBase};
-
-use uuid::Uuid;
-
-// Import your existing types (adjust path as needed)
-use crate::chunk::{Chunk, EmbeddedChunk};
-
+pub mod dedup;
 pub mod vector_store_node;
-pub use vector_store_node::VectorStorageNode;
 
-pub struct VectorStore {
-    db: Connection,
-    vector_dimension: i32,
+// Standard thread-safe boxed error for async traits
+pub type BoxError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileStatus {
+    New,       // URI not found, process normally
+    Unchanged, // URI found & hash matches, skip entirely
+    Modified,  // URI found & hash differs, delete old chunks and re-process
 }
 
-impl VectorStore {
-    /// Initializes the connection to LanceDB
-    pub async fn new(db_uri: &str, vector_dimension: i32) -> Result<Self, lancedb::Error> {
-        let db = connect(db_uri).execute().await?;
-        Ok(Self {
-            db,
-            vector_dimension,
-        })
-    }
+/// Backend-agnostic search result
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub id: String,
+    pub document_uri: String,
+    pub document_hash: String,
+    pub chunk_index: u32,
+    pub text: String,
+    pub pages: Vec<u32>,
+    pub score: f32, // Distance or similarity score
+}
 
-    /// Helper to get the Arrow Schema
-    fn get_schema(&self) -> Arc<ArrowSchema> {
-        Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("document_uri", DataType::Utf8, false),
-            Field::new("text", DataType::Utf8, false),
-            Field::new("pages", DataType::Utf8, false),
-            Field::new("vector", DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                self.vector_dimension,
-            ), false),
-        ]))
-    }
+/// The core trait any vector database (LanceDB, Supabase, Qdrant) will implement.
+/// (In Rust 1.75+, native `async fn` in traits works nicely if you don't need `dyn VectorStore`.
+/// If you need dynamic dispatch `Arc<dyn VectorStore>`, add `#[async_trait::async_trait]`).
+#[async_trait::async_trait]
+pub trait VectorStore: Send + Sync {
+    async fn store_chunks(&self, collection: &str, chunks: &[EmbeddedChunk]) -> Result<(), BoxError>;
 
-    /// Stores a batch of embedded chunks into the specified table
-    pub async fn store_chunks(&self, table_name: &str, chunks: &[EmbeddedChunk]) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = self.get_schema();
+    async fn search(
+        &self,
+        collection: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, BoxError>;
 
-        // 1. Initialize Arrow Builders
-        let mut id_builder = StringBuilder::new();
-        let mut uri_builder = StringBuilder::new();
-        let mut text_builder = StringBuilder::new();
-        let mut pages_builder = StringBuilder::new();
-        
-        let values_builder = PrimitiveBuilder::<Float32Type>::new();
-        let mut vector_builder = FixedSizeListBuilder::new(values_builder, self.vector_dimension);
+    async fn full_text_search(
+        &self,
+        collection: &str,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, BoxError>;
 
-        // 2. Populate Builders
-        for item in chunks {
-            id_builder.append_value(Uuid::new_v4().to_string());
-            uri_builder.append_value(item.chunk.document_uri.as_ref());
-            text_builder.append_value(item.chunk.text.as_str());
-            
-            let pages_str = item.chunk.pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-            pages_builder.append_value(pages_str);
-
-            for &val in &item.vector {
-                vector_builder.values().append_value(val);
-            }
-            vector_builder.append(true);
-        }
-
-        // 3. Finalize Arrow Arrays
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(id_builder.finish()),
-                Arc::new(uri_builder.finish()),
-                Arc::new(text_builder.finish()),
-                Arc::new(pages_builder.finish()),
-                Arc::new(vector_builder.finish()),
-            ],
+    /// Hybrid Search (Vector + FTS combined via Reciprocal Rank Fusion)
+    async fn hybrid_search(
+        &self,
+        collection: &str,
+        query_text: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, BoxError> {
+        // Fetch 2x limit from each retriever concurrently, then fuse with RRF
+        let fetch_k = limit * 2;
+        let (vec_res, fts_res) = tokio::try_join!(
+            self.search(collection, query_vector, fetch_k),
+            self.full_text_search(collection, query_text, fetch_k)
         )?;
+        Ok(reciprocal_rank_fusion(vec_res, fts_res, limit, 60.0))
+    }
 
-        // 4. Open or Create Table
-        if self.db.table_names().execute().await?.contains(&table_name.to_string()) {
-            let table = self.db.open_table(table_name).execute().await?;
-            // SIMPLIFIED: Vec<RecordBatch> naturally implements Scannable
-            table.add(vec![batch]).execute().await?;
-        } else {
-            // SIMPLIFIED: Vec<RecordBatch> naturally implements Scannable
-            self.db.create_table(table_name, vec![batch]).execute().await?;
-        }
+    async fn check_file_status(
+        &self,
+        collection: &str,
+        file_uri: &str,
+        new_hash: &str,
+    ) -> Result<FileStatus, BoxError>;
 
+    async fn delete_by_uri(&self, collection: &str, file_uri: &str) -> Result<(), BoxError>;
+
+    /// Optional maintenance hooks: Default to no-op for managed cloud DBs like Supabase
+    async fn optimize(&self, _collection: &str) -> Result<(), BoxError> {
         Ok(())
     }
 
-    /// Retrieves the top-k most similar chunks for a given query vector
-    pub async fn search(&self, table_name: &str, query_vector: &[f32], limit: usize) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
-        let table = self.db.open_table(table_name).execute().await?;
-        
-        // Execute the vector search
-        let mut stream = table
-            .query()
-            .nearest_to(query_vector)? // <-- Re-added the '?' 
-            .limit(limit)
-            .execute()
-            .await?;
-
-        let mut results = Vec::new();
-        
-        // Stream out the batches of results
-        while let Some(batch) = stream.next().await {
-            results.push(batch?);
-        }
-
-        Ok(results)
+    async fn ensure_indexes(&self, _collection: &str) -> Result<(), BoxError> {
+        Ok(())
     }
+}
+
+
+pub fn reciprocal_rank_fusion(
+    vector_results: Vec<SearchResult>,
+    fts_results: Vec<SearchResult>,
+    limit: usize,
+    k: f32, // Usually 60.0
+) -> Vec<SearchResult> {
+    let mut scores: HashMap<String, (f32, SearchResult)> = HashMap::new();
+
+    for (rank, item) in vector_results.into_iter().enumerate() {
+        let rrf_score = 1.0 / (k + (rank as f32) + 1.0);
+        scores.insert(item.id.clone(), (rrf_score, item));
+    }
+
+    for (rank, item) in fts_results.into_iter().enumerate() {
+        let rrf_score = 1.0 / (k + (rank as f32) + 1.0);
+        scores
+            .entry(item.id.clone())
+            .and_modify(|(score, _)| *score += rrf_score)
+            .or_insert((rrf_score, item));
+    }
+
+    let mut fused: Vec<SearchResult> = scores
+        .into_values()
+        .map(|(score, mut item)| {
+            item.score = score;
+            item
+        })
+        .collect();
+
+    // Sort highest RRF score first
+    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(limit);
+    fused
 }

@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::task;
-use sha2::{Sha256, Digest}; 
-use std::fs;
 
 use pdf_inspector::extract_text_with_positions;
 
@@ -31,6 +29,7 @@ impl PdfInspectorStrategy {
 impl ParserStrategy for PdfInspectorStrategy {
     async fn parse(&self, record: &Record) -> Result<Vec<Document>, DocumentError> {
         let uri = record.uri.clone();
+        let hash = record.hash.clone();
         let metadata = Arc::new(DocumentMetadata::default());
         let path = match &record.payload {
             Payload::Pointer(p) => p.clone(),
@@ -40,13 +39,6 @@ impl ParserStrategy for PdfInspectorStrategy {
         let max_elements = self.max_elements_per_document;
 
         let parsed_document = task::spawn_blocking(move || -> Result<Vec<Document>, DocumentError> {
-            let file_bytes = fs::read(&path)
-                .map_err(|e| DocumentError::ParseFailed(format!("Failed to read file: {}", e)))?;
-            
-            let mut hasher = Sha256::new();
-            hasher.update(&file_bytes);
-            let file_hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
             let positioned_items = extract_text_with_positions(&path)
                 .map_err(|e| DocumentError::ParseFailed(e.to_string()))?;
 
@@ -154,7 +146,7 @@ impl ParserStrategy for PdfInspectorStrategy {
                         uri: Arc::clone(&uri),
                         metadata: Arc::clone(&metadata),
                         elements: std::mem::take(&mut elements),
-                        hash: file_hash.clone(),
+                        hash: Arc::clone(&hash),
                     });
                 }
             }
@@ -169,7 +161,7 @@ impl ParserStrategy for PdfInspectorStrategy {
                     uri: Arc::clone(&uri),
                     metadata: Arc::clone(&metadata),
                     elements, 
-                    hash: file_hash,
+                    hash: Arc::clone(&hash),
                 });
             }
 

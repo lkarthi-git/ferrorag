@@ -5,8 +5,9 @@ use ferro_core::node::Node;
 use crate::source::Record;
 use std::sync::Arc; 
 
-
+#[cfg(feature = "pdf-inspector")]
 pub mod pdf;
+
 // 1. Define a Framework-Specific Error Type
 #[derive(Error, Debug)]
 pub enum DocumentError {
@@ -26,7 +27,7 @@ pub struct Document {
     pub uri: Arc<str>, 
     pub metadata: Arc<DocumentMetadata>,
     pub elements: Vec<Element>,
-    pub hash: String,
+    pub hash: Arc<str>,
 }
 
 #[derive(Debug, Clone, Default)]

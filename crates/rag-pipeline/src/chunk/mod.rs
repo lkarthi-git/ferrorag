@@ -4,15 +4,27 @@ use ferro_core::node::Node;
 // Adjust paths to your actual structs
 use crate::document::{Document, DocumentError};
 
-
+#[cfg(feature = "token-greedy-chunker")]
 pub mod token_greedy;
+#[cfg(feature = "structural-chunker")]
 pub mod structural;
+
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub document_uri: Arc<str>,
-    pub text: Arc<String>,
+    pub document_hash: Arc<str>,
+    pub chunk_index: u32,
+    pub text: Arc<str>,
     pub token_count: usize,
     pub pages: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct ChunkBlock {
+    header_context: String, // Stored separately so we only print it when it changes!
+    text: String,
+    token_count: usize,
+    page: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

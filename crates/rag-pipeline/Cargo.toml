@@ -3,6 +3,13 @@ name = "ferro-rag"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+token-greedy-chunker = ["dep:tokenizers"]
+structural-chunker = ["dep:tokenizers"]
+pdf-inspector = ["dep:pdf-inspector"]
+lance-db = ["dep:lancedb"]
+local-embeddings = ["dep:fastembed", "dep:ort"]
+
 [dependencies]
 ferro-core = { path = "../core" }
 async-trait.workspace = true
@@ -13,26 +20,23 @@ rayon = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+uuid = "1.28.0"
 bytes = "1.12.1"
 thiserror = "2.0.21"
-pdf-inspector = "1.25.2"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-metrics-exporter-prometheus = "0.18.3"
-tokenizers = {version = "0.23.2", features = ["http"] }
-fastembed = "7.1.1"
-
-ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching"] }
 sha2 = "0.11.1"
-lancedb = { version = "0.39.0", features = ["remote"] }
-uuid = "1.28.0"
+lancedb = { version = "0.39.0", features = ["remote"], optional = true }
+tokenizers = {version = "0.23.2", features = ["http"], optional = true }
+pdf-inspector = {version = "1.25.2", optional = true }
+ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching"],optional = true }
+fastembed = {version = "7.1.1", optional = true }
 
 # macOS-specific overrides: Use the correct compile feature 'coreml'
 [target.'cfg(target_os = "macos")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = [] }
+ort = { version = "2.0.0-rc.13", features = [] , optional = true}
 
 # Linux / Windows specific overrides: Use 'cuda
 [target.'cfg(target_os = "linux")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda"] , optional = true}
 
 [target.'cfg(target_os = "windows")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["cuda"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda"], optional = true }

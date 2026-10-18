@@ -10,12 +10,12 @@ use ferro_core::node::Node;
 
 pub struct VectorStorageNode {
     /// Use an Arc to share the connection safely across async boundaries
-    store: Arc<VectorStore>,
+    store: Arc<dyn VectorStore>,
     table_name: String,
 }
 
 impl VectorStorageNode {
-    pub fn new(store: Arc<VectorStore>, table_name: &str) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>, table_name: &str) -> Self {
         Self {
             store,
             table_name: table_name.to_string(),

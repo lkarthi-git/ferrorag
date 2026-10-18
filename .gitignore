@@ -25,4 +25,4 @@ target
 
 /target
 *.fastembed_cache
-/crates/rag-pipeline/data
+/data

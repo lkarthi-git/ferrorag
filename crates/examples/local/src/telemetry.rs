@@ -9,7 +9,7 @@ pub fn init_telemetry() {
     // variable (e.g., `RUST_LOG=info` or `RUST_LOG=ferro_rag=debug`).
 let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
-            EnvFilter::new("error,ferro_rag=info,ferro_core=info")
+            EnvFilter::new("info,lancedb=warn,hyper=warn,reqwest=warn,h2=warn,rustls=warn,ort=warn,fastembed=warn,pdf-inspector=error,pdf=error,lopdf=error,lance=warn,lance_core=warn,lance_index=warn,lance_table=warn")
         });
     tracing_subscriber::registry()
         .with(env_filter)

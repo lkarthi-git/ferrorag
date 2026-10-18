@@ -1,4 +1,4 @@
-use ferro_rag::store;
+use ferro_rag::store::{self, VectorStore};
 use tokio;
 use ferro_rag::source::FileSource;
 use ferro_rag::document::pdf::PdfInspectorStrategy;
@@ -8,7 +8,8 @@ use ferro_rag::embedding::LocalEmbeddingNode;
 use ferro_rag::chunk::structural::StructuralChunkerStrategy;
 use ferro_core::pipeline::Pipeline;
 use ferro_core::node::ChunkNode;
-use ferro_rag::telemetry::init_telemetry;
+use local::telemetry::init_telemetry;
+use ferro_rag::store::dedup::DeduplicatorNode;
 use std::sync::{Arc};
 
 
@@ -27,21 +28,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunker = ChunkerNode::new(StructuralChunkerStrategy::new("nomic-ai/nomic-embed-text-v1.5", 1000,50));
     let chunk_node = ChunkNode::new(2);
     let embedder = LocalEmbeddingNode::new().unwrap();
-    let store = store::VectorStore::new("/Users/sensehawk/Documents/ferrogent/ferrogent/crates/rag-pipeline/data/lancedb", 768).await.unwrap();
-    let vector_storage = store::VectorStorageNode::new(Arc::new(store), "chunks");
+    let store = Arc::new(store::lancedb::LanceDbStore::new("/Users/sensehawk/Documents/ferrogent/ferrogent/data/lancedb", 768).await?);
+    let deduplicator_node = DeduplicatorNode::new(store.clone(), "chunks",parser);
+    let vector_storage = store::vector_store_node::VectorStorageNode::new(store.clone(), "chunks");
     let batch_node = ChunkNode::new(500);
 
-    let pipeline = Pipeline::from_source(file, ferro_core::dlq::NoOpDLQ, 16)
-        .pipe(parser, 16)
+    let pipeline: Pipeline<ferro_rag::chunk::EmbeddedChunk> = Pipeline::from_source(file, ferro_core::dlq::NoOpDLQ, 16)
+        .pipe(deduplicator_node, 16)
         .pipe(chunker, 16)
         .pipe(chunk_node, 16)
         .pipe(embedder, 16)
         .pipe(batch_node, 16)
         .pipe(vector_storage, 16);
 
-    pipeline.for_each(|record| {
-        println!("{:?}", record);
-    }).await;
+    pipeline.execute().await;
+    tracing::info!("Evaluating vector index threshold...");
+    if let Err(e) = store.ensure_indexes("chunks").await {
+        tracing::error!("Failed to create/update IVF-PQ index: {}", e);
+    }
+    tracing::info!("Optimizing table...");
+    if let Err(e) = store.optimize("chunks").await {
+        tracing::error!("Failed to optimize table: {}", e);
+    }
     tracing::info!("Pipeline finished. Metrics server remains open on port 9000.");
     tracing::info!("Press Ctrl+C to exit...");
     tokio::signal::ctrl_c().await?;

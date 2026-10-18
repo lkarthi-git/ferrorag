@@ -51,11 +51,15 @@ impl ChunkerStrategy for TokenGreedyStrategy {
                 // 3. Flush condition
                 if current_chunk_tokens > 0 && (current_chunk_tokens + element_token_count > self.max_tokens) {
                     current_pages.dedup();
+                    let chunk_index = all_chunks.len() as u32;
+
                     all_chunks.push(Chunk {
                         document_uri: Arc::clone(&doc.uri),
-                        text: Arc::new(current_chunk_text.trim().to_string()),
+                        document_hash: Arc::clone(&doc.hash),
+                        text: Arc::from(current_chunk_text.trim().to_string()),
                         token_count: current_chunk_tokens,
                         pages: std::mem::take(&mut current_pages),
+                        chunk_index
                     });
                     
                     current_chunk_text.clear();
@@ -71,11 +75,14 @@ impl ChunkerStrategy for TokenGreedyStrategy {
                         // Decode the chunked slice back into a String
                         // `false` means don't skip special tokens (since we didn't add them anyway)
                         if let Ok(decoded_text) = self.tokenizer.decode(token_slice, false) {
+                             let chunk_index = all_chunks.len() as u32;
                             all_chunks.push(Chunk {
                                 document_uri: Arc::clone(&doc.uri),
-                                text: Arc::new(decoded_text.trim().to_string()),
+                                document_hash: Arc::clone(&doc.hash),
+                                text: Arc::from(decoded_text.trim().to_string()),
                                 token_count: token_slice.len(),
                                 pages: page_number.map(|p| vec![p]).unwrap_or_default(),
+                                chunk_index
                             });
                         }
                     }
@@ -97,11 +104,14 @@ impl ChunkerStrategy for TokenGreedyStrategy {
             // 6. Flush the final remaining buffer
             if current_chunk_tokens > 0 {
                 current_pages.dedup();
+                let chunk_index = all_chunks.len() as u32;
                 all_chunks.push(Chunk {
                     document_uri: Arc::clone(&doc.uri),
-                    text: Arc::new(current_chunk_text.trim().to_string()),
+                    document_hash: Arc::clone(&doc.hash),
+                    text: Arc::from(current_chunk_text.trim().to_string()),
                     token_count: current_chunk_tokens,
                     pages: current_pages,
+                    chunk_index
                 });
             }
 

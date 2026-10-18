@@ -6,6 +6,7 @@ use ferro_core::source::Source;
 use super::{Payload, Record};
 use std::sync::Arc;
 use tracing::{ error};
+use sha2::{Sha256, Digest}; 
 
 
 pub struct FileSource {
@@ -69,10 +70,18 @@ async fn next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
                 let uri: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
                 let mime_type: Arc<str> = Arc::from(Self::infer_mime_type(&path)); 
 
+                let file_bytes = fs::read(&path).await?;
+            
+                let mut hasher = Sha256::new();
+                hasher.update(&file_bytes);
+                let file_hash = Arc::from(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>());
+
+
                 return Ok(Some(Record { 
                     uri, 
                     mime_type, 
-                    payload: Payload::Pointer(path) 
+                    payload: Payload::Pointer(path),
+                    hash: file_hash,
                 }));
             }
 
