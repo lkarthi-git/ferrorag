@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod file_source;
 pub mod kafka_source;
+pub mod memory_source;
 
 
 pub use file_source::FileSource;

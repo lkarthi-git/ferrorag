@@ -30,9 +30,6 @@ pub struct SearchResult {
     pub score: f32, // Distance or similarity score
 }
 
-/// The core trait any vector database (LanceDB, Supabase, Qdrant) will implement.
-/// (In Rust 1.75+, native `async fn` in traits works nicely if you don't need `dyn VectorStore`.
-/// If you need dynamic dispatch `Arc<dyn VectorStore>`, add `#[async_trait::async_trait]`).
 #[async_trait::async_trait]
 pub trait VectorStore: Send + Sync {
     async fn store_chunks(&self, collection: &str, chunks: &[EmbeddedChunk]) -> Result<(), BoxError>;

@@ -122,7 +122,7 @@ impl ParserStrategy for PdfInspectorStrategy {
                         prev.text.push_str(&new_element.text);
                         
                         // Expand the bounding box to cover the new line
-                        let mut prev_bbox = prev.provenance.as_mut().unwrap().bounding_box.as_mut().unwrap();
+                        let prev_bbox = prev.provenance.as_mut().unwrap().bounding_box.as_mut().unwrap();
                         
                         // Safely expand the box regardless of coordinate direction
                         prev_bbox.y_max = prev_bbox.y_max.max(bbox.y_max); 
