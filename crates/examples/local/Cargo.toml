@@ -5,9 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-ferro-rag = { path = "../../rag-pipeline", features = ["lance-db","structural-chunker","pdf-inspector","local-embeddings"] }
+ferro-rag = { path = "../../rag-pipeline", features = ["lance-db","structural-chunker","pdf-inspector","candle","metal"] }
 ferro-core = { path = "../../core" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 metrics-exporter-prometheus = "0.18.3"
+csv = "1.4.0"
+serde = "1.0.229"

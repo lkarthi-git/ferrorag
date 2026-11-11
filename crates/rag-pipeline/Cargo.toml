@@ -8,7 +8,9 @@ token-greedy-chunker = ["dep:tokenizers"]
 structural-chunker = ["dep:tokenizers"]
 pdf-inspector = ["dep:pdf-inspector"]
 lance-db = ["dep:lancedb"]
-local-embeddings = ["dep:fastembed", "dep:ort"]
+candle = ["dep:candle-core","dep:candle-nn","dep:hf-hub","dep:tokenizers","dep:candle-transformers","dep:gliner25-rs","dep:ort"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 ferro-core = { path = "../core" }
@@ -20,6 +22,8 @@ rayon = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
 uuid = "1.28.0"
 bytes = "1.12.1"
 thiserror = "2.0.21"
@@ -27,12 +31,16 @@ sha2 = "0.11.1"
 lancedb = { version = "0.39.0", features = ["remote"], optional = true }
 tokenizers = {version = "0.23.2", features = ["http"], optional = true }
 pdf-inspector = {version = "1.25.2", optional = true }
-ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching"],optional = true }
-fastembed = {version = "7.1.1", optional = true }
+ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching","download-binaries"],optional = true }
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = {version = "0.11.0", optional = true }
+hf-hub = {version = "1.0.0",features = ["blocking"], optional = true }
+gliner25-rs = { version ="0.5.6", features=["hub"], optional =true}
 
 # macOS-specific overrides: Use the correct compile feature 'coreml'
 [target.'cfg(target_os = "macos")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = [] , optional = true}
+ort = { version = "2.0.0-rc.13", features = ["coreml"] , optional = true}
 
 # Linux / Windows specific overrides: Use 'cuda
 [target.'cfg(target_os = "linux")'.dependencies]

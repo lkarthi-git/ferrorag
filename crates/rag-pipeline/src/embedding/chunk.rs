@@ -3,16 +3,16 @@ use ferro_core::node::Node;
 use crate::chunk::{Chunk, EmbeddedChunk}; 
 use std::sync::Arc;
 use std::future::Future;
-use crate::embedding_backend::{EmbeddingBackend};
+use crate::embedding_backend::{AdvancedEmbeddingBackend};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct ChunkEmbeddingNode {
-    backend: Arc<dyn EmbeddingBackend>,
+    backend: Arc<dyn AdvancedEmbeddingBackend>,
 }
 
 impl ChunkEmbeddingNode {
-    pub fn new(backend: Arc<dyn EmbeddingBackend>) -> Self {
+    pub fn new(backend: Arc<dyn AdvancedEmbeddingBackend>) -> Self {
         Self { backend }
     }
 }

@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use async_trait::async_trait;
 use tokenizers::Tokenizer;
 
-use crate::document::{Document, DocumentError, ElementType};
+use crate::document::{Document, DocumentError, DocumentMetadata, ElementType};
 use crate::chunk::{ChunkerStrategy, Chunk,ChunkBlock};
 
 pub struct StructuralChunkerStrategy {
@@ -90,6 +90,7 @@ impl ChunkerStrategy for StructuralChunkerStrategy {
                             Arc::clone(&doc.uri),
                             0,
                             Arc::clone(&doc.hash),
+                            Arc::clone(&doc.metadata)
                         );
                     }
                     Self::update_headers(&mut active_headers, level, element.text.clone());
@@ -143,6 +144,7 @@ impl ChunkerStrategy for StructuralChunkerStrategy {
                                 self.overlap_tokens,
                                 Arc::clone(&doc.uri),
                                 Arc::clone(&doc.hash),
+                                Arc::clone(&doc.metadata)
                             );
                         }
                         continue;
@@ -162,6 +164,7 @@ impl ChunkerStrategy for StructuralChunkerStrategy {
                         self.overlap_tokens,
                         Arc::clone(&doc.uri),
                         Arc::clone(&doc.hash),
+                        Arc::clone(&doc.metadata)
                     );
                 }
                 continue;
@@ -182,6 +185,7 @@ impl ChunkerStrategy for StructuralChunkerStrategy {
                 self.overlap_tokens,
                 Arc::clone(&doc.uri),
                 Arc::clone(&doc.hash),
+                Arc::clone(&doc.metadata)
             );
         }
 
@@ -194,6 +198,7 @@ impl ChunkerStrategy for StructuralChunkerStrategy {
                 Arc::clone(&doc.uri),
                 0,
                 Arc::clone(&doc.hash),
+                 Arc::clone(&doc.metadata)
             );
         }
 
@@ -210,9 +215,10 @@ fn push_to_window(
     overlap_tokens: usize,
     uri: Arc<str>,
     hash: Arc<str>,
+    metadata: Arc<DocumentMetadata>
 ) {
     if *window_tokens + block.token_count > max_tokens && !window.is_empty() {
-        flush_window(window, window_tokens, all_chunks, uri, overlap_tokens, hash);
+        flush_window(window, window_tokens, all_chunks, uri, overlap_tokens, hash,metadata);
     }
 
     *window_tokens += block.token_count;
@@ -226,6 +232,7 @@ fn flush_window(
     uri: Arc<str>,
     overlap_tokens: usize,
     hash: Arc<str>,
+    metadata: Arc<DocumentMetadata>
 ) {
     let mut combined_text = String::new();
     let mut pages = Vec::new();
@@ -256,6 +263,10 @@ fn flush_window(
         text: Arc::from(combined_text.trim().to_string()),
         token_count: *window_tokens,
         pages,
+        metadata,
+        entities:Vec::new(),
+        triplets:Vec::new(),
+        chunk_attributes: HashMap::new()
     });
 
     while *window_tokens > overlap_tokens && !window.is_empty() {

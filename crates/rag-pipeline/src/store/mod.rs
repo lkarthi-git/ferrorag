@@ -1,6 +1,9 @@
 use std::error::Error;
-use crate::chunk::EmbeddedChunk;
+use crate::chunk::{EmbeddedChunk,ExtractedEntity,Triplet};
 use std::collections::HashMap;
+use crate::search::QueryMetadata;
+use crate::document::DocumentMetadata;
+use std::sync::Arc;
 
 #[cfg(feature = "lance-db")]
 pub mod lancedb;
@@ -25,9 +28,15 @@ pub struct SearchResult {
     pub document_uri: String,
     pub document_hash: String,
     pub chunk_index: u32,
+    pub token_count: usize,
     pub text: String,
     pub pages: Vec<u32>,
-    pub score: f32, // Distance or similarity score
+    pub entities: Vec<ExtractedEntity>,
+    pub triplets: Vec<Triplet>,
+    pub chunk_attributes: HashMap<String, String>,
+    pub metadata: DocumentMetadata,
+    pub score: f32,
+    pub query_metadata: Arc<QueryMetadata>,
 }
 
 #[async_trait::async_trait]
@@ -39,14 +48,27 @@ pub trait VectorStore: Send + Sync {
         collection: &str,
         query_vector: &[f32],
         limit: usize,
+        query_metadata: Arc<QueryMetadata>,
     ) -> Result<Vec<SearchResult>, BoxError>;
+    
 
     async fn full_text_search(
         &self,
         collection: &str,
         query_text: &str,
         limit: usize,
+        query_metadata: Arc<QueryMetadata>,
     ) -> Result<Vec<SearchResult>, BoxError>;
+
+    async fn expand_context(
+        &self,
+        table_name: &str,
+        candidates: &[SearchResult],
+        window_size: i32,
+        query_metadata: Arc<QueryMetadata>,
+    ) -> Result<Vec<SearchResult>, BoxError>;
+
+    async fn drop_table(&self, collection: &str) -> Result<(),BoxError>;
 
     /// Hybrid Search (Vector + FTS combined via Reciprocal Rank Fusion)
     async fn hybrid_search(
@@ -55,14 +77,16 @@ pub trait VectorStore: Send + Sync {
         query_text: &str,
         query_vector: &[f32],
         limit: usize,
+        query_metadata: Arc<QueryMetadata>,
+        rrf_k: f32
     ) -> Result<Vec<SearchResult>, BoxError> {
         // Fetch 2x limit from each retriever concurrently, then fuse with RRF
         let fetch_k = limit * 2;
         let (vec_res, fts_res) = tokio::try_join!(
-            self.search(collection, query_vector, fetch_k),
-            self.full_text_search(collection, query_text, fetch_k)
+            self.search(collection, query_vector, fetch_k,query_metadata.clone()),
+            self.full_text_search(collection, query_text, fetch_k,query_metadata)
         )?;
-        Ok(reciprocal_rank_fusion(vec_res, fts_res, limit, 60.0))
+        Ok(reciprocal_rank_fusion(vec_res, fts_res, limit, rrf_k))
     }
 
     async fn check_file_status(
@@ -83,6 +107,7 @@ pub trait VectorStore: Send + Sync {
         Ok(())
     }
 }
+
 
 
 pub fn reciprocal_rank_fusion(

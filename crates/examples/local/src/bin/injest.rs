@@ -1,11 +1,12 @@
-use ferro_rag::{embedding_backend::EmbeddingBackend, store::{self, VectorStore}};
+use ferro_rag::{store::{self, VectorStore}};
 use tokio;
 use ferro_rag::source::FileSource;
 use ferro_rag::document::pdf::PdfInspectorStrategy;
 use ferro_rag::document::DocumentParserNode;
 use ferro_rag::chunk::ChunkerNode;
 use ferro_rag::embedding::chunk::ChunkEmbeddingNode;
-use ferro_rag::embedding_backend::local::LocalEmbedder;
+use ferro_rag::embedding_backend::candle::CandleEmbedder;
+use ferro_rag::embedding_backend::AdvancedEmbeddingBackend;
 use ferro_rag::chunk::structural::StructuralChunkerStrategy;
 use ferro_core::pipeline::Pipeline;
 use ferro_core::node::ChunkNode;
@@ -29,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parser = DocumentParserNode::new().with_strategy("application/pdf", PdfInspectorStrategy::new());
     let chunker = ChunkerNode::new(StructuralChunkerStrategy::new("nomic-ai/nomic-embed-text-v1.5", 1000,50));
     let chunk_node: ChunkNode<ferro_rag::chunk::Chunk> = ChunkNode::new(2);
-    let local_embedder = Arc::new(LocalEmbedder::nomic_v1_5().unwrap());
+    let local_embedder = Arc::new(CandleEmbedder::nomic_v1_5().unwrap());
     let embedder = ChunkEmbeddingNode::new(local_embedder.clone());
     let store = Arc::new(store::lancedb::LanceDbStore::new("/Users/sensehawk/Documents/ferrogent/ferrogent/data/lancedb", local_embedder.vector_dimension() as i32).await?);
     let deduplicator_node = DeduplicatorNode::new(store.clone(), "chunks",parser);

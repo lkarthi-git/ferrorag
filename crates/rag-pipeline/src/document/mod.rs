@@ -4,7 +4,9 @@ use thiserror::Error;
 use ferro_core::node::Node;
 use crate::source::Record;
 use std::sync::Arc; 
+use serde::{Serialize, Deserialize};
 
+pub mod json;
 #[cfg(feature = "pdf-inspector")]
 pub mod pdf;
 
@@ -30,7 +32,7 @@ pub struct Document {
     pub hash: Arc<str>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default,Serialize, Deserialize)]
 pub struct DocumentMetadata {
     pub author: Option<String>,
     pub created_at: Option<String>, 

@@ -33,19 +33,20 @@ impl Node for VectorSearchNode {
         let store = self.store.clone();
         let table_name = self.table_name.clone();
         let mode = self.mode;
+        let metadata = input.metadata.clone();
         async move {
             let results = match mode {
                 SearchMode::Vector => {
                     // Requires only the vector
-                    store.search(&table_name, &input.vector, input.limit).await?
+                    store.search(&table_name, &input.vector, input.limit,metadata).await?
                 },
                 SearchMode::FullText => {
                     // Requires only the raw text
-                    store.full_text_search(&table_name, &input.text, input.limit).await?
+                    store.full_text_search(&table_name, &input.text, input.limit,metadata).await?
                 },
-                SearchMode::Hybrid => {
+                SearchMode::Hybrid { rrf_k } => {
                     // Requires both text and vector
-                    store.hybrid_search(&table_name, &input.text, &input.vector, input.limit).await?
+                    store.hybrid_search(&table_name, &input.text, &input.vector, input.limit,metadata,rrf_k).await?
                 }
             };
             Ok(results)

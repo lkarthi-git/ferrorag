@@ -3,9 +3,9 @@ use ferro_core::dlq::NoOpDLQ;
 use ferro_rag::source::memory_source::MemorySource;
 use ferro_rag::store::{self, VectorStore};
 use ferro_rag::embedding::query::QueryEmbeddingNode;
-use ferro_rag::embedding_backend::local::LocalEmbedder;
-use ferro_rag::embedding_backend::EmbeddingBackend;
-use ferro_rag::search::{Query,SearchMode};
+use ferro_rag::embedding_backend::candle::CandleEmbedder;
+use ferro_rag::embedding_backend::AdvancedEmbeddingBackend;
+use ferro_rag::search::{Query,SearchMode,QueryMetadata};
 use ferro_rag::search::vector::VectorSearchNode;
 use ferro_rag::search::print::PrintResultsNode;
 use std::time::Duration;
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mode_str = &args[pos + 1];
             mode = match mode_str.to_lowercase().as_str() {
                 "fulltext" => SearchMode::FullText,
-                "hybrid" => SearchMode::Hybrid,
+                "hybrid" => SearchMode::Hybrid { rrf_k: 60.0 },
                 "vector" => SearchMode::Vector,
                 _ => {
                     tracing::warn!("Unknown mode '{}', defaulting to vector", mode_str);
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Searching for: '{}' using mode: {:?}", query_text, mode);
 
     // 1. Initialize Backend & Extract Dimension
-    let local_embedder = Arc::new(LocalEmbedder::nomic_v1_5().unwrap());
+    let local_embedder = Arc::new(CandleEmbedder::nomic_v1_5().unwrap());
     let dimension = local_embedder.vector_dimension();
 
     // 2. Initialize Store using dynamic dimension
@@ -70,11 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_node = QueryEmbeddingNode::new(local_embedder.clone());
     let search_node = VectorSearchNode::new(store, "chunks", mode);
     let print_node = PrintResultsNode;
-
+    let metadata: QueryMetadata = QueryMetadata::default();
     // 4. Memory Source
     let source_queries = vec![Query {
         text: query_text,
-        limit: 5, 
+        limit: 5,
+        metadata: Arc::new(metadata),
     }]; 
     let memory_source = MemorySource::new(source_queries, Duration::ZERO);
     // 5. Execute Pipeline
