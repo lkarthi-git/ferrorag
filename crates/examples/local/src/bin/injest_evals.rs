@@ -45,8 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entity_extractor = GraphExtractionNode::new(extraction_labels,Vec::new()).map_err(|e| e as Box<dyn std::error::Error>)?;
     let deduplicator_node = DeduplicatorNode::new(store.clone(), "eval_chunks", parser);
     let batch_node  = ChunkNode::new(4);
-    let embedder = LateChunkingNode::new(local_embedder.clone(),"nomic-ai/nomic-embed-text-v1.5",local_embedder.vector_dimension(),50);
-    let batch_node_2  = ChunkNode::new(16);
+    let embedder = LateChunkingNode::new(local_embedder.clone(),"nomic-ai/nomic-embed-text-v1.5",256,50);
+    // let batch_node_2  = ChunkNode::new(16);
     let batch_node_3 = ChunkNode::new(500);
     let vector_storage = VectorStorageNode::new(store.clone(), "eval_chunks");
 
@@ -54,7 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pipe(deduplicator_node, 16)
         .pipe(chunker, 16)
         .pipe(batch_node, 16)
-        .pipe(entity_extractor, 16).pipe(batch_node_2, 16)
+        // .pipe(entity_extractor, 16)
+        // .pipe(batch_node_2, 16)
         .pipe(embedder, 16)
         .pipe(batch_node_3, 16)
         .pipe(vector_storage, 16);

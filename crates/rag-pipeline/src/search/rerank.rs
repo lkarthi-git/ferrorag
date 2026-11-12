@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 use candle_core::{Device, IndexOp, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config};
+use candle_nn::{ VarBuilder};
+use candle_transformers::models::xlm_roberta::{XLMRobertaForSequenceClassification, Config};
 use hf_hub::{HFClientSync, RepoTypeAny};
 use tokenizers::Tokenizer;
 
@@ -14,43 +14,8 @@ use ferro_core::node::Node;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// ---------------------------------------------------------------------------
-// 1. Model Definition for Sequence Classification
-// ---------------------------------------------------------------------------
-pub struct BertForSequenceClassification {
-    pub bert: BertModel,
-    pub classifier: Linear,
-}
-
-impl BertForSequenceClassification {
-    pub fn load(vb: VarBuilder, config: &Config) -> candle_core::Result<Self> {
-        let bert = BertModel::load(vb.clone(), config)?;
-        let num_labels = 1;
-        let hidden_size = config.hidden_size; 
-        
-        let classifier = candle_nn::linear(hidden_size, num_labels, vb.pp("classifier"))?;
-        
-        Ok(Self { bert, classifier })
-    }
-
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: &Tensor,
-        token_type_ids: &Tensor,
-    ) -> candle_core::Result<Tensor> {
-        let embeddings = self.bert.forward(input_ids, token_type_ids, None)?;
-        let cls_token = embeddings.i((.., 0, ..))?;
-        self.classifier.forward(&cls_token)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2. The Candle Cross-Encoder Reranker
-// ---------------------------------------------------------------------------
-
 pub struct CandleReranker {
-    model: Arc<BertForSequenceClassification>,
+    model: Arc<XLMRobertaForSequenceClassification>,
     tokenizer: Arc<Mutex<Tokenizer>>,
     device: Device,
 }
@@ -96,11 +61,17 @@ impl CandleReranker {
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| format!("Tokenizer error: {}", e))?;
 
+        let dtype = if device.is_cuda() || device.is_metal() {
+            candle_core::DType::F16 
+        } else {
+            candle_core::DType::F32
+        };
+
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)?
+            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
         };
         
-        let model = BertForSequenceClassification::load(vb, &config)
+        let model = XLMRobertaForSequenceClassification::new(1, &config, vb)
             .map_err(|e| format!("Failed to load Reranker Model: {}", e))?;
 
         Ok(Self {
@@ -111,23 +82,88 @@ impl CandleReranker {
     }
 
     pub fn predict_scores_sync(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>, BoxError> {
-        let tokenizer = self.tokenizer.lock().unwrap();
-        let mut scores = Vec::with_capacity(docs.len());
+        if docs.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        let mut tokenizer = self.tokenizer.lock().unwrap();
+        
+        // 1. Enable padding for the batch
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
 
-        for doc in docs {
-            let encoding = tokenizer.encode((query, *doc), true)
-                .map_err(|e| format!("Tokenization error: {}", e))?;
+        // 2. Enable truncation (CRITICAL for Cross-Encoders)
+        let _result = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 256,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            ..Default::default()
+        }));
 
-            let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
-            let attention_mask = Tensor::new(encoding.get_attention_mask(), &self.device)?.unsqueeze(0)?;
-            let type_ids = Tensor::new(encoding.get_type_ids(), &self.device)?.unsqueeze(0)?;
+        // 3. Pair the single query with every document in the batch
+        let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, *d)).collect();
+        
+        // 4. Batch encode the pairs
+        let encodings = tokenizer.encode_batch(pairs, true)
+            .map_err(|e| format!("Batch tokenization error: {}", e))?;
 
-            let logits = self.model.forward(&input_ids, &attention_mask, &type_ids)?;
-            let score = logits.squeeze(0)?.squeeze(0)?.to_scalar::<f32>()?;
-            scores.push(score);
+        let batch_size = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut all_ids = Vec::with_capacity(batch_size * seq_len);
+        let mut all_type_ids = Vec::with_capacity(batch_size * seq_len);
+        let mut all_masks_u8 = Vec::with_capacity(batch_size * seq_len);
+
+        for encoding in &encodings {
+            all_ids.extend_from_slice(encoding.get_ids());
+            // Extract type IDs to satisfy Candle's signature
+            all_type_ids.extend_from_slice(encoding.get_type_ids());
+            all_masks_u8.extend(encoding.get_attention_mask().iter().map(|&x| x as u8));
         }
 
-        Ok(scores)
+        // 5. Create 2D batch tensors
+        let input_ids = Tensor::from_vec(all_ids, (batch_size, seq_len), &self.device)?;
+        let type_ids = Tensor::from_vec(all_type_ids, (batch_size, seq_len), &self.device)?;
+        let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, seq_len), &self.device)?;
+
+        // 6. Mini-batch execution to keep the M1 cache happy
+        let chunk_size = if self.device.is_cuda() {
+            128 // Feed the NVIDIA beast massive chunks
+        } else if self.device.is_metal() {
+            16  // Keep the M1 SRAM cache happy
+        } else {
+            8   // CPU fallback (keep it very small)
+        };
+        let mut all_scores = Vec::with_capacity(batch_size);
+
+        for i in (0..batch_size).step_by(chunk_size) {
+            let end = std::cmp::min(i + chunk_size, batch_size);
+            
+            // Slice out 16 documents at a time
+            let chunk_input = input_ids.i((i..end, ..))?;
+            let chunk_mask = attention_mask.i((i..end, ..))?;
+            let chunk_type = type_ids.i((i..end, ..))?;
+
+            // Process just the chunk
+            let logits = self.model.forward(&chunk_input, &chunk_mask, &chunk_type)?;
+            
+            // Cast and extract
+            let logits_f32 = if logits.dtype() != candle_core::DType::F32 { 
+                logits.to_dtype(candle_core::DType::F32)? 
+            } else { 
+                logits 
+            };
+            
+            let scores = logits_f32.squeeze(1)?.to_vec1::<f32>()?;
+            all_scores.extend(scores);
+        }
+        
+        // 7. Reset tokenizer state
+        tokenizer.with_padding(None);
+        let _result = tokenizer.with_truncation(None);
+
+        Ok(all_scores)
     }
 }
 
@@ -201,8 +237,15 @@ impl Node for SearchAndRerankNode {
 
             let scores = match scores_result {
                 Ok(Ok(s)) => s,
-                _ => {
-                    tracing::error!("Reranking inference failed, returning un-reranked results");
+                Ok(Err(e)) => {
+                    // Exposes the actual Candle tensor/shape error
+                    tracing::error!("Reranking inference failed with error: {:?}", e);
+                    results.truncate(final_top_k);
+                    return Ok(results);
+                }
+                Err(join_err) => {
+                    // Exposes thread panics (e.g., Out of Memory)
+                    tracing::error!("Reranking thread panicked: {:?}", join_err);
                     results.truncate(final_top_k);
                     return Ok(results);
                 }

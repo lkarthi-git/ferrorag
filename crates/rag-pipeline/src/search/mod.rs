@@ -9,6 +9,12 @@ pub mod parent;
 pub mod rerank;
 
 
+pub enum BaseSearchNode {
+    Vector(vector::VectorSearchNode),
+    SearchAndRerank(rerank::SearchAndRerankNode),
+}
+
+
 #[derive(Debug, Clone, Copy)]
 pub enum SearchMode {
     Vector,

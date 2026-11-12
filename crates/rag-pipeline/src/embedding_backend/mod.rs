@@ -28,8 +28,7 @@ pub trait AdvancedEmbeddingBackend: Send + Sync {
     async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, BoxError>;
     
     /// Advanced Late Chunking: Returns the unpooled GPU token embeddings
-    async fn embed_document_tokens(&self, document: &str) -> Result<crate::embedding::token::TokenEmbeddings, BoxError>;
-    
+    async fn embed_document_tokens(&self, documents: Vec<String>) -> Result<Vec<crate::embedding::token::TokenEmbeddings>, BoxError>;
     fn vector_dimension(&self) -> usize;
     fn max_batch_size(&self) -> usize;
 }

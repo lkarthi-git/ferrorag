@@ -55,7 +55,7 @@ impl DatasetLoader for BeirDatasetLoader {
                 if let (Some(q_id), Some(text)) = (parsed["_id"].as_str(), parsed["text"].as_str()) {
                     all_queries.push(Query {
                         text: text.to_string(),
-                        limit: 15,
+                        limit: 50,
                         metadata: Arc::new(QueryMetadata {
                             query_id: q_id.to_string(),
                             trace_id: format!("eval-{}", q_id),

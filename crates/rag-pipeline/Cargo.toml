@@ -8,8 +8,8 @@ token-greedy-chunker = ["dep:tokenizers"]
 structural-chunker = ["dep:tokenizers"]
 pdf-inspector = ["dep:pdf-inspector"]
 lance-db = ["dep:lancedb"]
-candle = ["dep:candle-core","dep:candle-nn","dep:hf-hub","dep:tokenizers","dep:candle-transformers","dep:gliner25-rs","dep:ort"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+candle = ["dep:candle-core","dep:candle-nn","dep:hf-hub","dep:tokenizers","dep:candle-transformers","dep:gliner25-rs"]
+cuda = ["candle-core/cuda", "candle-nn/cuda","candle-transformers/cuda","candle-transformers/flash-attn"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
@@ -31,20 +31,8 @@ sha2 = "0.11.1"
 lancedb = { version = "0.39.0", features = ["remote"], optional = true }
 tokenizers = {version = "0.23.2", features = ["http"], optional = true }
 pdf-inspector = {version = "1.25.2", optional = true }
-ort = { version = "2.0.0-rc.13", features = ["lax-feature-matching","download-binaries"],optional = true }
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 candle-transformers = {version = "0.11.0", optional = true }
 hf-hub = {version = "1.0.0",features = ["blocking"], optional = true }
 gliner25-rs = { version ="0.5.6", features=["hub"], optional =true}
-
-# macOS-specific overrides: Use the correct compile feature 'coreml'
-[target.'cfg(target_os = "macos")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["coreml"] , optional = true}
-
-# Linux / Windows specific overrides: Use 'cuda
-[target.'cfg(target_os = "linux")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["cuda"] , optional = true}
-
-[target.'cfg(target_os = "windows")'.dependencies]
-ort = { version = "2.0.0-rc.13", features = ["cuda"], optional = true }

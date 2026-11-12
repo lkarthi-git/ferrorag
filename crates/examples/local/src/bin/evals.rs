@@ -8,6 +8,8 @@ use ferro_rag::{
     source::memory_source::MemorySource,
     store::{self, SearchResult},
     search::parent::VectorAndParentSearchNode,
+    search::BaseSearchNode,
+    search::rerank::{CandleReranker,SearchAndRerankNode}
 };
 use ferro_rag::embedding_backend::candle::CandleEmbedder;
 use ferro_rag::embedding_backend::AdvancedEmbeddingBackend;
@@ -38,15 +40,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 3. Initialize Evaluator Components
     let evaluator = StandardDocumentEvaluator::new(5);
-    
+    let bge_reranker_model = Arc::new(CandleReranker::new("BAAI/bge-reranker-base", "main")?);
+
     let k_values = [10.0, 30.0, 60.0, 100.0, 150.0];
     for rrf_k in k_values {
         let eval_source = MemorySource::new(queries.clone(), Duration::ZERO);
         let query_node = QueryEmbeddingNode::new(local_embedder.clone());
         
         let search_node = VectorSearchNode::new(store.clone(), "eval_chunks", SearchMode::Hybrid { rrf_k });
-        let parent_search_node = VectorAndParentSearchNode::new(search_node, store.clone(), "eval_chunks", 2);
 
+
+        let search_and_rerank_node = SearchAndRerankNode::new(
+            search_node, 
+            bge_reranker_model.clone(), 
+            arc_query_text_map.clone(), 
+            10 
+        )?;
+
+        let parent_search_node = VectorAndParentSearchNode::new(
+            BaseSearchNode::SearchAndRerank(search_and_rerank_node), 
+            store.clone(), 
+            "eval_chunks", 
+            2 
+        );
         let eval_pipeline = Pipeline::from_source(eval_source, NoOpDLQ, 16)
             .pipe(query_node, 16)
             .pipe(parent_search_node, 16);

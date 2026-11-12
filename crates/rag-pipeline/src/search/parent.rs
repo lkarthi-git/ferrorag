@@ -2,11 +2,11 @@ use ferro_core::node::Node;
 use crate::store::{VectorStore, SearchResult};
 use std::future::Future;
 use std::collections::{HashMap, HashSet};
-use super::{EmbeddedQuery, vector::VectorSearchNode};
+use super::{EmbeddedQuery};
 use std::sync::Arc;
 
 pub struct VectorAndParentSearchNode {
-    search_node: VectorSearchNode,
+    search_node: super::BaseSearchNode,
     store: Arc<dyn VectorStore>,
     table_name: String,
     window_size: i32,
@@ -14,7 +14,7 @@ pub struct VectorAndParentSearchNode {
 
 impl VectorAndParentSearchNode {
     pub fn new(
-        search_node: VectorSearchNode,
+        search_node: super::BaseSearchNode,
         store: Arc<dyn VectorStore>,
         table_name: impl Into<String>,
         window_size: i32,
@@ -88,7 +88,14 @@ impl Node for VectorAndParentSearchNode {
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send {
         async move {
             // 1. Initial Vector Search 
-            let candidates = self.search_node.execute(input).await?;
+            let candidates = match &self.search_node {
+                super::BaseSearchNode::SearchAndRerank(node) =>{
+                    node.execute(input).await?
+                },
+                super::BaseSearchNode::Vector(node) =>{
+                    node.execute(input).await?
+                }
+            };
 
             if candidates.is_empty() {
                 return Ok(vec![]);
