@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-ferro-rag = { path = "../../rag-pipeline", features = ["lance-db","structural-chunker","pdf-inspector","candle","metal"] }
+ferro-rag = { path = "../../rag-pipeline", features = ["lance-db","structural-chunker","pdf-inspector","candle","cuda"] }
 ferro-core = { path = "../../core" }
 tokio = { workspace = true }
 tracing = { workspace = true }

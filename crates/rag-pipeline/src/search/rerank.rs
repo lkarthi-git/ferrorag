@@ -1,10 +1,10 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 
 use candle_core::{Device, IndexOp, Tensor};
-use candle_nn::{ VarBuilder};
-use candle_transformers::models::xlm_roberta::{XLMRobertaForSequenceClassification, Config};
+use candle_nn::VarBuilder;
+use candle_transformers::models::xlm_roberta::{Config, XLMRobertaForSequenceClassification};
 use hf_hub::{HFClientSync, RepoTypeAny};
 use tokenizers::Tokenizer;
 
@@ -25,10 +25,10 @@ impl CandleReranker {
         let device = Device::new_cuda(0)
             .or_else(|_| Device::new_metal(0))
             .unwrap_or(Device::Cpu);
-            
+
         // Using your exact HFClientSync and RepoTypeAny pattern
         let client = HFClientSync::new().map_err(|e| format!("Failed to init HF API: {}", e))?;
-        
+
         let parts: Vec<&str> = repo_id.split('/').collect();
         let (owner, name) = if parts.len() == 2 {
             (parts[0].to_string(), parts[1].to_string())
@@ -38,39 +38,40 @@ impl CandleReranker {
 
         let repo = client.repository(RepoTypeAny::Model, owner, name);
 
-        let config_path = repo.download_file()
+        let config_path = repo
+            .download_file()
             .filename("config.json")
             .revision(revision.to_string())
             .send()
             .map_err(|e| format!("Failed to download config: {}", e))?;
-            
-        let weights_path = repo.download_file()
+
+        let weights_path = repo
+            .download_file()
             .filename("model.safetensors")
             .revision(revision.to_string())
             .send()
             .map_err(|e| format!("Failed to download weights: {}", e))?;
-            
-        let tokenizer_path = repo.download_file()
+
+        let tokenizer_path = repo
+            .download_file()
             .filename("tokenizer.json")
             .revision(revision.to_string())
             .send()
             .map_err(|e| format!("Failed to download tokenizer: {}", e))?;
 
         let config: Config = serde_json::from_reader(std::fs::File::open(config_path)?)?;
-        
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| format!("Tokenizer error: {}", e))?;
+
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| format!("Tokenizer error: {}", e))?;
 
         let dtype = if device.is_cuda() || device.is_metal() {
-            candle_core::DType::F16 
+            candle_core::DType::BF16
         } else {
             candle_core::DType::F32
         };
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
-        };
-        
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
+
         let model = XLMRobertaForSequenceClassification::new(1, &config, vb)
             .map_err(|e| format!("Failed to load Reranker Model: {}", e))?;
 
@@ -85,9 +86,9 @@ impl CandleReranker {
         if docs.is_empty() {
             return Ok(vec![]);
         }
-        
+
         let mut tokenizer = self.tokenizer.lock().unwrap();
-        
+
         // 1. Enable padding for the batch
         tokenizer.with_padding(Some(tokenizers::PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
@@ -103,9 +104,10 @@ impl CandleReranker {
 
         // 3. Pair the single query with every document in the batch
         let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, *d)).collect();
-        
+
         // 4. Batch encode the pairs
-        let encodings = tokenizer.encode_batch(pairs, true)
+        let encodings = tokenizer
+            .encode_batch(pairs, true)
             .map_err(|e| format!("Batch tokenization error: {}", e))?;
 
         let batch_size = encodings.len();
@@ -129,17 +131,17 @@ impl CandleReranker {
 
         // 6. Mini-batch execution to keep the M1 cache happy
         let chunk_size = if self.device.is_cuda() {
-            128 // Feed the NVIDIA beast massive chunks
+            32 // Feed the NVIDIA beast massive chunks
         } else if self.device.is_metal() {
-            16  // Keep the M1 SRAM cache happy
+            16 // Keep the M1 SRAM cache happy
         } else {
-            8   // CPU fallback (keep it very small)
+            8 // CPU fallback (keep it very small)
         };
         let mut all_scores = Vec::with_capacity(batch_size);
 
         for i in (0..batch_size).step_by(chunk_size) {
             let end = std::cmp::min(i + chunk_size, batch_size);
-            
+
             // Slice out 16 documents at a time
             let chunk_input = input_ids.i((i..end, ..))?;
             let chunk_mask = attention_mask.i((i..end, ..))?;
@@ -147,18 +149,18 @@ impl CandleReranker {
 
             // Process just the chunk
             let logits = self.model.forward(&chunk_input, &chunk_mask, &chunk_type)?;
-            
+
             // Cast and extract
-            let logits_f32 = if logits.dtype() != candle_core::DType::F32 { 
-                logits.to_dtype(candle_core::DType::F32)? 
-            } else { 
-                logits 
+            let logits_f32 = if logits.dtype() != candle_core::DType::F32 {
+                logits.to_dtype(candle_core::DType::F32)?
+            } else {
+                logits
             };
-            
+
             let scores = logits_f32.squeeze(1)?.to_vec1::<f32>()?;
             all_scores.extend(scores);
         }
-        
+
         // 7. Reset tokenizer state
         tokenizer.with_padding(None);
         let _result = tokenizer.with_truncation(None);
@@ -206,14 +208,14 @@ impl Node for SearchAndRerankNode {
         // Clone Arc handles rather than requiring direct object clones
         let search_node = Arc::clone(&self.search_node);
         let input = input.clone();
-        
+
         let reranker = self.reranker.clone();
         let query_text_map = self.query_text_map.clone();
         let final_top_k = self.final_top_k;
-        
+
         async move {
             let mut results = search_node.execute(&input).await?;
-            
+
             if results.is_empty() {
                 return Ok(results);
             }
@@ -233,7 +235,8 @@ impl Node for SearchAndRerankNode {
             let scores_result = tokio::task::spawn_blocking(move || {
                 let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
                 reranker.predict_scores_sync(&query_text, &doc_refs)
-            }).await;
+            })
+            .await;
 
             let scores = match scores_result {
                 Ok(Ok(s)) => s,

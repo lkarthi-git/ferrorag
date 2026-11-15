@@ -1,10 +1,10 @@
+use csv::Writer;
+use serde::Serialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
-use serde::Serialize;
-use csv::Writer;
-use serde_json::Value;
 
 use ferro_rag::search::{Query, QueryMetadata};
 use ferro_rag::store::SearchResult;
@@ -15,7 +15,16 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // 1. DATASET LOADER
 // ==========================================
 pub trait DatasetLoader {
-    fn load(&self) -> Result<(Vec<Query>, HashMap<String, Vec<String>>, Arc<HashMap<String, String>>), BoxError>;
+    fn load(
+        &self,
+    ) -> Result<
+        (
+            Vec<Query>,
+            HashMap<String, Vec<String>>,
+            Arc<HashMap<String, String>>,
+        ),
+        BoxError,
+    >;
 }
 
 pub struct BeirDatasetLoader {
@@ -33,7 +42,16 @@ impl BeirDatasetLoader {
 }
 
 impl DatasetLoader for BeirDatasetLoader {
-    fn load(&self) -> Result<(Vec<Query>, HashMap<String, Vec<String>>, Arc<HashMap<String, String>>), BoxError> {
+    fn load(
+        &self,
+    ) -> Result<
+        (
+            Vec<Query>,
+            HashMap<String, Vec<String>>,
+            Arc<HashMap<String, String>>,
+        ),
+        BoxError,
+    > {
         // 1. Load Ground Truth (qrels)
         let mut ground_truth: HashMap<String, Vec<String>> = HashMap::new();
         let qrels_file = File::open(&self.qrels_path)?;
@@ -42,7 +60,10 @@ impl DatasetLoader for BeirDatasetLoader {
             if parts.len() >= 3 {
                 let score: i32 = parts[2].parse().unwrap_or(0);
                 if score > 0 {
-                    ground_truth.entry(parts[0].to_string()).or_default().push(parts[1].to_string());
+                    ground_truth
+                        .entry(parts[0].to_string())
+                        .or_default()
+                        .push(parts[1].to_string());
                 }
             }
         }
@@ -52,10 +73,11 @@ impl DatasetLoader for BeirDatasetLoader {
         let queries_file = File::open(&self.queries_path)?;
         for line in BufReader::new(queries_file).lines().flatten() {
             if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                if let (Some(q_id), Some(text)) = (parsed["_id"].as_str(), parsed["text"].as_str()) {
+                if let (Some(q_id), Some(text)) = (parsed["_id"].as_str(), parsed["text"].as_str())
+                {
                     all_queries.push(Query {
                         text: text.to_string(),
-                        limit: 50,
+                        limit: 15,
                         metadata: Arc::new(QueryMetadata {
                             query_id: q_id.to_string(),
                             trace_id: format!("eval-{}", q_id),
@@ -68,11 +90,13 @@ impl DatasetLoader for BeirDatasetLoader {
         }
 
         // 3. Filter and Map
-        let queries: Vec<Query> = all_queries.into_iter()
+        let queries: Vec<Query> = all_queries
+            .into_iter()
             .filter(|q| ground_truth.contains_key(&q.metadata.query_id))
             .collect();
 
-        let query_text_map: HashMap<String, String> = queries.iter()
+        let query_text_map: HashMap<String, String> = queries
+            .iter()
             .map(|q| (q.metadata.query_id.clone(), q.text.clone()))
             .collect();
 
@@ -90,7 +114,11 @@ pub struct QueryMetrics {
 }
 
 pub trait Evaluator {
-    fn evaluate_query(&self, raw_results: &[SearchResult], expected_docs: &[String]) -> QueryMetrics;
+    fn evaluate_query(
+        &self,
+        raw_results: &[SearchResult],
+        expected_docs: &[String],
+    ) -> QueryMetrics;
 }
 
 pub struct StandardDocumentEvaluator {
@@ -105,7 +133,10 @@ impl StandardDocumentEvaluator {
     fn calculate_ndcg_at_k(results: &[&SearchResult], expected_docs: &[String], k: usize) -> f64 {
         let mut dcg = 0.0;
         for (i, result) in results.iter().take(k).enumerate() {
-            if expected_docs.iter().any(|exp| result.document_uri.contains(exp)) {
+            if expected_docs
+                .iter()
+                .any(|exp| result.document_uri.contains(exp))
+            {
                 let rank = i + 1;
                 dcg += 1.0 / ((rank + 1) as f64).log2();
             }
@@ -123,17 +154,25 @@ impl StandardDocumentEvaluator {
 }
 
 impl Evaluator for StandardDocumentEvaluator {
-    fn evaluate_query(&self, raw_results: &[SearchResult], expected_docs: &[String]) -> QueryMetrics {
+    fn evaluate_query(
+        &self,
+        raw_results: &[SearchResult],
+        expected_docs: &[String],
+    ) -> QueryMetrics {
         // 1. DEDUPLICATE: Convert chunk-level results to document-level results
         let mut seen_uris = HashSet::new();
-        let doc_level_results: Vec<&SearchResult> = raw_results.iter()
+        let doc_level_results: Vec<&SearchResult> = raw_results
+            .iter()
             .filter(|res| seen_uris.insert(&res.document_uri))
             .collect();
 
         // 2. Calculate Rank
         let mut rank = 0;
         for (i, result) in doc_level_results.iter().enumerate() {
-            if expected_docs.iter().any(|exp| result.document_uri.contains(exp)) {
+            if expected_docs
+                .iter()
+                .any(|exp| result.document_uri.contains(exp))
+            {
                 rank = i + 1;
                 break;
             }
@@ -143,7 +182,11 @@ impl Evaluator for StandardDocumentEvaluator {
         let hit_at_k = rank > 0 && rank <= self.k;
         let ndcg = Self::calculate_ndcg_at_k(&doc_level_results, expected_docs, self.k);
 
-        QueryMetrics { hit_at_k, reciprocal_rank, ndcg }
+        QueryMetrics {
+            hit_at_k,
+            reciprocal_rank,
+            ndcg,
+        }
     }
 }
 
@@ -151,7 +194,12 @@ impl Evaluator for StandardDocumentEvaluator {
 // 3. REPORTER
 // ==========================================
 pub trait ResultReporter {
-    fn report(&mut self, query_id: &str, query_text: &str, metrics: &QueryMetrics) -> Result<(), BoxError>;
+    fn report(
+        &mut self,
+        query_id: &str,
+        query_text: &str,
+        metrics: &QueryMetrics,
+    ) -> Result<(), BoxError>;
     fn flush(&mut self) -> Result<(), BoxError>;
 }
 
@@ -177,7 +225,12 @@ impl CsvReporter {
 }
 
 impl ResultReporter for CsvReporter {
-    fn report(&mut self, query_id: &str, query_text: &str, metrics: &QueryMetrics) -> Result<(), BoxError> {
+    fn report(
+        &mut self,
+        query_id: &str,
+        query_text: &str,
+        metrics: &QueryMetrics,
+    ) -> Result<(), BoxError> {
         self.wtr.serialize(CsvEvalRow {
             query_id,
             query_text,

@@ -1,12 +1,12 @@
-use async_trait::async_trait;
-use candle_core::{Device, Tensor,IndexOp};
-use candle_nn::VarBuilder;
-use candle_transformers::models::nomic_bert::{Config, NomicBertModel};
-use hf_hub::{HFClientSync,RepoTypeAny};
-use std::sync::{Arc, Mutex};
-use tokenizers::Tokenizer;
 use crate::embedding::token::TokenEmbeddings;
 use crate::embedding_backend::AdvancedEmbeddingBackend;
+use async_trait::async_trait;
+use candle_core::{Device, IndexOp, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::nomic_bert::{Config, NomicBertModel};
+use hf_hub::{HFClientSync, RepoTypeAny};
+use std::sync::{Arc, Mutex};
+use tokenizers::Tokenizer;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -19,6 +19,71 @@ pub struct CandleEmbedder {
     document_prefix: Option<String>,
     vector_dimension: usize,
     max_batch_size: usize,
+    max_batch_tokens: usize,
+}
+
+// Helper function used by embed_documents to process safe-sized batches
+fn forward_batch(
+    embedder: &CandleEmbedder,
+    encodings: &[tokenizers::Encoding],
+    max_len: usize,
+) -> Result<Vec<TokenEmbeddings>, BoxError> {
+    let batch_size = encodings.len();
+    let total_elements = batch_size * max_len;
+
+    // 1. Pre-allocate and zero-initialize the entire flattened arrays once
+    let mut all_ids = vec![0u32; total_elements];
+    let mut all_type_ids = vec![0u32; total_elements];
+    let mut all_masks_u8 = vec![0u8; total_elements];
+
+    // 2. Overwrite the non-padded sections with actual token data
+    for (i, enc) in encodings.iter().enumerate() {
+        let ids = enc.get_ids();
+        let type_ids = enc.get_type_ids();
+        let mask = enc.get_attention_mask();
+        let seq_len = ids.len();
+
+        // Calculate the flat array boundaries for this specific document
+        let start = i * max_len;
+        let end = start + seq_len;
+
+        // Fast slice copying (C-style memcopy) for contiguous memory
+        all_ids[start..end].copy_from_slice(ids);
+        all_type_ids[start..end].copy_from_slice(type_ids);
+
+        // Tokenizer yields masks as u32, but Candle expects u8
+        for (j, &m) in mask.iter().enumerate() {
+            all_masks_u8[start + j] = m as u8;
+        }
+    }
+
+    // 3. Tensor creation and inference
+    let token_tensor = Tensor::from_vec(all_ids, (batch_size, max_len), &embedder.device)?;
+    let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, max_len), &embedder.device)?;
+    let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, max_len), &embedder.device)?;
+
+    let hidden_states =
+        embedder
+            .model
+            .forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
+
+    let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
+        hidden_states.to_dtype(candle_core::DType::F32)?
+    } else {
+        hidden_states
+    };
+
+    let mut results = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let doc_hidden = hidden_states.i((i, .., ..))?.contiguous()?;
+
+        results.push(TokenEmbeddings {
+            hidden_states: doc_hidden.unsqueeze(0)?,
+            device: embedder.device.clone(),
+        });
+    }
+
+    Ok(results)
 }
 
 impl CandleEmbedder {
@@ -28,62 +93,60 @@ impl CandleEmbedder {
         document_prefix: Option<&str>,
         vector_dimension: usize,
         max_batch_size: usize,
+        max_batch_tokens: usize,
     ) -> Result<Self, BoxError> {
         let device = Device::new_cuda(0)
             .or_else(|_| Device::new_metal(0))
             .unwrap_or(Device::Cpu);
         let client = HFClientSync::new().map_err(|e| format!("Failed to init HF API: {}", e))?;
-        
 
-    let parts: Vec<&str> = repo_id.split('/').collect();
-    let (owner, name) = if parts.len() == 2 {
-        (parts[0].to_string(), parts[1].to_string())
-    } else {
-        ("".to_string(), repo_id.to_string()) // Flat repo name with no explicit owner/namespace
-    };
+        let parts: Vec<&str> = repo_id.split('/').collect();
+        let (owner, name) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            ("".to_string(), repo_id.to_string()) // Flat repo name with no explicit owner/namespace
+        };
 
-    // 4. Construct Repo Handle
-    // If you always target models, prefer: client.model(owner, name)
-    // If you need runtime dynamic types using RepoTypeAny:
-    let repo_type = RepoTypeAny::Model;
-    let repo = client.repository(repo_type, owner, name);
+        // 4. Construct Repo Handle
+        // If you always target models, prefer: client.model(owner, name)
+        // If you need runtime dynamic types using RepoTypeAny:
+        let repo_type = RepoTypeAny::Model;
+        let repo = client.repository(repo_type, owner, name);
 
-    let config_path = repo
-        .download_file()
-        .filename("config.json")
-        .revision("main".to_string()) // <--- Set revision here
-        .send()
-        .map_err(|e| format!("Failed to download config: {}", e))?;
+        let config_path = repo
+            .download_file()
+            .filename("config.json")
+            .revision("main".to_string()) // <--- Set revision here
+            .send()
+            .map_err(|e| format!("Failed to download config: {}", e))?;
 
-    let weights_path = repo
-        .download_file()
-        .filename("model.safetensors")
-        .revision("main".to_string()) // <--- Set revision here
-        .send()
-        .map_err(|e| format!("Failed to download weights: {}", e))?;
-        
-    let tokenizer_path = repo
-        .download_file()
-        .filename("tokenizer.json")
-        .revision("main".to_string()) // <--- Set revision here
-        .send()
-        .map_err(|e| format!("Failed to download tokenizer: {}", e))?;
+        let weights_path = repo
+            .download_file()
+            .filename("model.safetensors")
+            .revision("main".to_string()) // <--- Set revision here
+            .send()
+            .map_err(|e| format!("Failed to download weights: {}", e))?;
+
+        let tokenizer_path = repo
+            .download_file()
+            .filename("tokenizer.json")
+            .revision("main".to_string()) // <--- Set revision here
+            .send()
+            .map_err(|e| format!("Failed to download tokenizer: {}", e))?;
 
         let config: Config = serde_json::from_reader(std::fs::File::open(config_path)?)?;
-        
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| format!("Tokenizer error: {}", e))?;
+
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| format!("Tokenizer error: {}", e))?;
 
         let dtype = if device.is_cuda() || device.is_metal() {
-            candle_core::DType::F16 
+            candle_core::DType::BF16
         } else {
             candle_core::DType::F32
         };
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
-        };
-        
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
+
         let model = NomicBertModel::load(vb, &config)
             .map_err(|e| format!("Failed to load BertModel: {}", e))?;
 
@@ -95,6 +158,7 @@ impl CandleEmbedder {
             document_prefix: document_prefix.map(|s| s.to_string()),
             vector_dimension,
             max_batch_size,
+            max_batch_tokens,
         })
     }
 
@@ -105,14 +169,20 @@ impl CandleEmbedder {
             Some("search_document: "),
             768,
             256,
+            80_000,
         )
     }
 
     fn encode_tokens_sync(&self, text: &str) -> Result<TokenEmbeddings, BoxError> {
         let (token_ids, mask_ids) = {
             let tokenizer = self.tokenizer.lock().unwrap();
-            let tokens = tokenizer.encode(text, true).map_err(|e| format!("Token error: {}", e))?;
-            (tokens.get_ids().to_vec(), tokens.get_attention_mask().to_vec())
+            let tokens = tokenizer
+                .encode(text, true)
+                .map_err(|e| format!("Token error: {}", e))?;
+            (
+                tokens.get_ids().to_vec(),
+                tokens.get_attention_mask().to_vec(),
+            )
         };
 
         let token_tensor = Tensor::new(token_ids.as_slice(), &self.device)?.unsqueeze(0)?;
@@ -121,7 +191,9 @@ impl CandleEmbedder {
         let mask_u8: Vec<u8> = mask_ids.into_iter().map(|x| x as u8).collect();
         let attention_mask = Tensor::new(mask_u8.as_slice(), &self.device)?.unsqueeze(0)?;
 
-        let hidden_states = self.model.forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
+        let hidden_states =
+            self.model
+                .forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
 
         let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
             hidden_states.to_dtype(candle_core::DType::F32)?
@@ -138,68 +210,82 @@ impl CandleEmbedder {
 
 #[async_trait]
 impl AdvancedEmbeddingBackend for CandleEmbedder {
-    async fn embed_document_tokens(&self, documents: Vec<String>) -> Result<Vec<TokenEmbeddings>, BoxError> {
-            if documents.is_empty() {
-                return Ok(vec![]);
-            }
-            
+    async fn embed_document_tokens(
+        &self,
+        documents: Vec<String>,
+    ) -> Result<Vec<TokenEmbeddings>, BoxError> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+
         let embedder = self.clone();
 
-        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<TokenEmbeddings>, BoxError> {
-            let mut tokenizer = embedder.tokenizer.lock().unwrap();
-            
-            tokenizer.with_padding(Some(tokenizers::PaddingParams {
-                strategy: tokenizers::PaddingStrategy::BatchLongest,
-                ..Default::default()
-            }));
+        let embeddings =
+            tokio::task::spawn_blocking(move || -> Result<Vec<TokenEmbeddings>, BoxError> {
+                let mut tokenizer = embedder.tokenizer.lock().unwrap();
 
-            let encodings = tokenizer.encode_batch(documents, true)
-                .map_err(|e| format!("Batch tokenization error: {}", e))?;
+                tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                    max_length: 8192,
+                    ..Default::default()
+                }));
 
-            let batch_size = encodings.len();
-            if batch_size == 0 {
-                return Ok(vec![]);
-            }
-            
-            let seq_len = encodings[0].get_ids().len(); 
-            let mut all_ids = Vec::with_capacity(batch_size * seq_len);
-            let mut all_type_ids = Vec::with_capacity(batch_size * seq_len);
-            let mut all_masks_u8 = Vec::with_capacity(batch_size * seq_len);
-            for encoding in &encodings {
-                all_ids.extend_from_slice(encoding.get_ids());
-                all_type_ids.extend_from_slice(encoding.get_type_ids());
-                all_masks_u8.extend(encoding.get_attention_mask().iter().map(|&x| x as u8));
-            }
+                let mut all_results = Vec::with_capacity(documents.len());
 
-            // Send entire batch to GPU
-            let token_tensor = Tensor::from_vec(all_ids, (batch_size, seq_len), &embedder.device)?;
-            let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, seq_len), &embedder.device)?;
-            let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, seq_len), &embedder.device)?;
-            
-            // Single forward pass for the whole batch
-            let hidden_states = embedder.model.forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
-            
-            let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
-                hidden_states.to_dtype(candle_core::DType::F32)?
-            } else {
-                hidden_states
-            };
+                // Process macro-chunks 1-by-1.
+                // At 8,192 tokens, a single attention matrix is ~805 million elements.
+                // Batching them causes 32-bit CUDA index overflows.
+                for text in documents {
+                    tokenizer.with_padding(None); // No padding needed for BS=1
 
-            // Slice the 3D tensor (batch_size, seq_len, hidden_dim) back down to 
-            // individual TokenEmbeddings so Late Chunking span logic works transparently.
-            let mut results = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                let doc_hidden = hidden_states.i((i, .., ..))?;
-                results.push(TokenEmbeddings {
-                    hidden_states: doc_hidden.unsqueeze(0)?, 
-                    device: embedder.device.clone(),
-                });
-            }
+                    let encoding = tokenizer
+                        .encode(text, true)
+                        .map_err(|e| format!("Tokenization error: {}", e))?;
 
-            tokenizer.with_padding(None);
+                    let seq_len = encoding.get_ids().len();
+                    if seq_len == 0 {
+                        continue;
+                    }
 
-            Ok(results)
-        }).await??;
+                    let all_ids = encoding.get_ids();
+                    let all_type_ids = encoding.get_type_ids();
+                    let all_masks_u8: Vec<u8> = encoding
+                        .get_attention_mask()
+                        .iter()
+                        .map(|&x| x as u8)
+                        .collect();
+
+                    let token_tensor =
+                        Tensor::from_vec(all_ids.to_vec(), (1, seq_len), &embedder.device)?;
+                    let token_type_ids =
+                        Tensor::from_vec(all_type_ids.to_vec(), (1, seq_len), &embedder.device)?;
+                    let attention_mask =
+                        Tensor::from_vec(all_masks_u8, (1, seq_len), &embedder.device)?;
+
+                    let hidden_states = embedder.model.forward(
+                        &token_tensor,
+                        Some(&token_type_ids),
+                        Some(&attention_mask),
+                    )?;
+
+                    let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
+                        hidden_states.to_dtype(candle_core::DType::F32)?
+                    } else {
+                        hidden_states
+                    };
+
+                    let doc_hidden = hidden_states.i((0, .., ..))?.contiguous()?;
+
+                    all_results.push(TokenEmbeddings {
+                        hidden_states: doc_hidden.unsqueeze(0)?,
+                        device: embedder.device.clone(),
+                    });
+                }
+
+                tokenizer.with_truncation(None);
+
+                Ok(all_results)
+            })
+            .await??;
 
         Ok(embeddings)
     }
@@ -216,104 +302,128 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
 
         let embedding = tokio::task::spawn_blocking(move || {
             let local_adapter = CandleEmbedder {
-                model, tokenizer, device, query_prefix: None, document_prefix: None,
-                vector_dimension: 0, max_batch_size: 0,
+                model,
+                tokenizer,
+                device,
+                query_prefix: None,
+                document_prefix: None,
+                vector_dimension: 0,
+                max_batch_size: 0,
+                max_batch_tokens: 0,
             };
-            
+
             // Execute forward pass
             let tokens = local_adapter.encode_tokens_sync(&query_text)?;
-            
+
             // Pool the entire sequence (0 to seq_len)
             let seq_len = tokens.hidden_states.dim(1)?;
             let mut vectors = tokens.pool_spans(&[(0, seq_len)])?;
-            
-            vectors.pop().ok_or_else(|| BoxError::from("Failed to extract vector"))
-        }).await??;
+
+            vectors
+                .pop()
+                .ok_or_else(|| BoxError::from("Failed to extract vector"))
+        })
+        .await??;
 
         Ok(embedding)
     }
 
     async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, BoxError> {
         let docs_to_embed: Vec<String> = match &self.document_prefix {
-            Some(prefix) => texts.into_iter().map(|t| format!("{}{}", prefix, t)).collect(),
+            Some(prefix) => texts
+                .into_iter()
+                .map(|t| format!("{}{}", prefix, t))
+                .collect(),
             None => texts,
         };
 
+        if docs_to_embed.is_empty() {
+            return Ok(vec![]);
+        }
+
         let embedder = self.clone();
 
-        let embeddings = tokio::task::spawn_blocking(move || {
+        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, BoxError> {
             let mut tokenizer = embedder.tokenizer.lock().unwrap();
-            
-            // 1. Enable padding to equalize all sequence lengths in the batch
-            tokenizer.with_padding(Some(tokenizers::PaddingParams {
-                strategy: tokenizers::PaddingStrategy::BatchLongest,
+
+            tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 8192,
                 ..Default::default()
             }));
 
-            // 2. Batch encode
-            let encodings = tokenizer.encode_batch(docs_to_embed, true)
+            // Pre-tokenize to safely group batches based on actual token lengths
+            let encodings = tokenizer
+                .encode_batch(docs_to_embed, true)
                 .map_err(|e| format!("Batch tokenization error: {}", e))?;
 
-            let batch_size = encodings.len();
-            if batch_size == 0 {
-                return Ok::<Vec<Vec<f32>>, BoxError>(vec![]);
-            }
-            
-            let seq_len = encodings[0].get_ids().len(); 
-            
-            // 3. Pre-allocate 1D vectors for the flattened batch
-            let mut all_ids = Vec::with_capacity(batch_size * seq_len);
-            let mut all_type_ids = Vec::with_capacity(batch_size * seq_len);
-            let mut all_masks_u8 = Vec::with_capacity(batch_size * seq_len);
+            let mut all_results = Vec::with_capacity(encodings.len());
+            let mut current_batch = Vec::new();
+            let mut current_max_len = 0;
 
-            for encoding in &encodings {
-                all_ids.extend_from_slice(encoding.get_ids());
-                all_type_ids.extend_from_slice(encoding.get_type_ids());
-                // U8 cast for Metal/CUDA where_cond compatibility
-                all_masks_u8.extend(encoding.get_attention_mask().iter().map(|&x| x as u8));
-            }
+            let max_vram_tokens = embedder.max_batch_tokens;
 
-            // 4. Create 2D (batch_size, seq_len) Tensors
-            let token_tensor = Tensor::from_vec(all_ids, (batch_size, seq_len), &embedder.device)?;
-            let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, seq_len), &embedder.device)?;
-            let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, seq_len), &embedder.device)?;
-            
-            // 5. ONE massive forward pass for the whole batch
-            let hidden_states = embedder.model.forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
-            
-            // 6. Immediately cast to F32
-            let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
-                hidden_states.to_dtype(candle_core::DType::F32)?
-            } else {
-                hidden_states
-            };
+            for encoding in encodings {
+                let seq_len = encoding.get_ids().len();
+                if seq_len == 0 {
+                    all_results.push(vec![0.0; embedder.vector_dimension()]);
+                    continue;
+                }
 
-            // 7. Slice the 3D tensor back into individual documents for pooling
-            let mut results = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                let doc_hidden = hidden_states.i((i, .., ..))?;
-                
-                let dummy_tokens = TokenEmbeddings {
-                    hidden_states: doc_hidden.unsqueeze(0)?, 
-                    device: embedder.device.clone(),
-                };
-                
-                let mut vectors = dummy_tokens.pool_spans(&[(0, seq_len)])?;
-                results.push(vectors.pop().unwrap());
+                let next_max_len = std::cmp::max(current_max_len, seq_len);
+                let potential_batch_size = current_batch.len() + 1;
+
+                // Memory with Flash Attention scales linearly: Batch Size * Max Length
+                let total_batch_tokens = potential_batch_size * next_max_len;
+
+                // Check against BOTH struct limits: raw batch size AND total token volume
+                let hits_token_limit = total_batch_tokens > max_vram_tokens;
+                let hits_batch_limit = potential_batch_size > embedder.max_batch_size();
+
+                if (hits_token_limit || hits_batch_limit) && !current_batch.is_empty() {
+                    let batch_embeddings =
+                        forward_batch(&embedder, &current_batch, current_max_len)?;
+
+                    for (dummy_tokens, enc) in batch_embeddings.into_iter().zip(&current_batch) {
+                        let actual_seq_len = enc.get_ids().len();
+                        let mut vectors = dummy_tokens.pool_spans(&[(0, actual_seq_len)])?;
+                        all_results.push(vectors.pop().unwrap());
+                    }
+
+                    current_batch.clear();
+                    current_max_len = 0;
+                }
+
+                current_max_len = std::cmp::max(current_max_len, seq_len);
+                current_batch.push(encoding);
             }
 
-            // Disable padding to not pollute single-query calls later
+            // Catch any remaining sequences
+            if !current_batch.is_empty() {
+                let batch_embeddings = forward_batch(&embedder, &current_batch, current_max_len)?;
+                for (dummy_tokens, enc) in batch_embeddings.into_iter().zip(&current_batch) {
+                    let actual_seq_len = enc.get_ids().len();
+                    let mut vectors = dummy_tokens.pool_spans(&[(0, actual_seq_len)])?;
+                    all_results.push(vectors.pop().unwrap());
+                }
+
+                current_batch.clear();
+                current_max_len = 0;
+            }
+
             tokenizer.with_padding(None);
-            
-            Ok(results)
-        }).await??;
+            tokenizer.with_truncation(None);
+
+            Ok(all_results)
+        })
+        .await??;
 
         Ok(embeddings)
     }
 
-
-    
-
-    fn vector_dimension(&self) -> usize { self.vector_dimension }
-    fn max_batch_size(&self) -> usize { self.max_batch_size }
+    fn vector_dimension(&self) -> usize {
+        self.vector_dimension
+    }
+    fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
 }
