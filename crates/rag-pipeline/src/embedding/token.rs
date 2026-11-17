@@ -20,16 +20,18 @@ impl TokenEmbeddings {
                 continue;
             }
 
-            // 1. Slice the 256-token window from the full 8000-token tensor
+            // 1. Slice the window from the full tensor
             let span_tensor = self.hidden_states.narrow(1, start, chunk_len)?;
 
             // 2. Mean Pool the span
             let sum_embeddings = span_tensor.sum(1)?;
             let mean_pooled = (sum_embeddings / (chunk_len as f64))?;
 
-            // 3. L2 Normalize (Required for Nomic)
+            // 3. L2 Normalize (Standard practice for Jina / Cosine Similarity)
             let l2_norm = mean_pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
-            let eps = Tensor::new(1e-12f32, &self.device)?.to_dtype(l2_norm.dtype())?;
+            
+            // Ensure eps matches the dtype of mean_pooled (f32 or bf16)
+            let eps = Tensor::new(1e-12f32, &self.device)?.to_dtype(mean_pooled.dtype())?;
 
             let safe_l2_norm = l2_norm.broadcast_add(&eps)?;
             let normalized = mean_pooled.broadcast_div(&safe_l2_norm)?;

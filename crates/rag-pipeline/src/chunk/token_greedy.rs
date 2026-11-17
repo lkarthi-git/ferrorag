@@ -12,7 +12,7 @@ pub struct TokenGreedyStrategy {
 
 impl TokenGreedyStrategy {
     /// Initialize with the Hugging Face model ID matching your fastembed model.
-    /// Example: "BAAI/bge-small-en-v1.5" or "nomic-ai/nomic-embed-text-v1.5"
+    /// Example: "BAAI/bge-small-en-v1.5" or "jinaai/jina-embeddings-v2-base-en"
     pub fn new(hf_model_name: &str, max_tokens: usize) -> Self {
         // Automatically fetches the exact tokenizer rules for your chosen model
         let tokenizer = Tokenizer::from_pretrained(hf_model_name, None)

@@ -28,9 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path: String = args[1].clone();
     let file = FileSource::new(file_path).await.unwrap();
     let parser = DocumentParserNode::new().with_strategy("application/pdf", PdfInspectorStrategy::new());
-    let chunker = ChunkerNode::new(StructuralChunkerStrategy::new("nomic-ai/nomic-embed-text-v1.5", 1000,50));
+    let chunker = ChunkerNode::new(StructuralChunkerStrategy::new("jinaai/jina-embeddings-v2-base-en", 1000,50));
     let chunk_node: ChunkNode<ferro_rag::chunk::Chunk> = ChunkNode::new(2);
-    let local_embedder = Arc::new(CandleEmbedder::nomic_v1_5().unwrap());
+    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
     let embedder = ChunkEmbeddingNode::new(local_embedder.clone());
     let store = Arc::new(store::lancedb::LanceDbStore::new("/Users/sensehawk/Documents/ferrogent/ferrogent/data/lancedb", local_embedder.vector_dimension() as i32).await?);
     let deduplicator_node = DeduplicatorNode::new(store.clone(), "chunks",parser);

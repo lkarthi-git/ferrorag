@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // 2. Initialize Pipeline Architecture
-    let local_embedder = Arc::new(CandleEmbedder::nomic_v1_5().unwrap());
+    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
     let db_path = "data/lancedb_eval";
     let store = Arc::new(
         store::lancedb::LanceDbStore::new(db_path, local_embedder.vector_dimension() as i32)

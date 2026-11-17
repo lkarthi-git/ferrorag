@@ -51,11 +51,10 @@ impl Node for LateChunkingNode {
         let overlap = self.overlap_tokens;
 
         async move {
-            let prefix = "search_document: ";
             let max_seq_len = 8192; // Must match the backend's truncation limit
 
             // Calculate prefix tokens without special tokens, then add 1 for the [CLS] token
-            let prefix_token_count = tokenizer.encode(prefix, false).unwrap().get_ids().len() + 1;
+            let prefix_token_count =  1;
 
             // PHASE 1: Batch Preparation (CPU)
             let tokenizer_clone = tokenizer.clone();
@@ -65,12 +64,11 @@ impl Node for LateChunkingNode {
 
                 for parent_chunk in parent_chunks {
                     let text = parent_chunk.text.to_string();
-                    let formatted_text = format!("{}{}", prefix, text);
-                    formatted_inputs.push(formatted_text.clone());
+                    formatted_inputs.push(text.clone());
 
                     // Tokenize EXACTLY as the backend will (with special tokens)
                     let encoding = tokenizer_clone
-                        .encode(formatted_text, true)
+                        .encode(text, true)
                         .map_err(|e| e.to_string())?;
                     let all_ids = encoding.get_ids();
 

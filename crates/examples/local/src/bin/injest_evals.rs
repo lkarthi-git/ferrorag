@@ -24,12 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parser =
         DocumentParserNode::new().with_strategy("application/x-ndjson", JsonlParserStrategy);
     let chunker = ChunkerNode::new(StructuralChunkerStrategy::new(
-        "nomic-ai/nomic-embed-text-v1.5",
+        "jinaai/jina-embeddings-v2-base-en",
         8000,
         256,
     ));
 
-    let local_embedder = Arc::new(CandleEmbedder::nomic_v1_5().unwrap());
+    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
     let db_path = "data/lancedb_eval";
     let store = Arc::new(
         store::lancedb::LanceDbStore::new(db_path, local_embedder.vector_dimension() as i32)
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_node = ChunkNode::new(4);
     let embedder = LateChunkingNode::new(
         local_embedder.clone(),
-        "nomic-ai/nomic-embed-text-v1.5",
+        "jinaai/jina-embeddings-v2-base-en",
         local_embedder.vector_dimension(),
         50,
     );

@@ -1,9 +1,10 @@
 use crate::embedding::token::TokenEmbeddings;
 use crate::embedding_backend::AdvancedEmbeddingBackend;
 use async_trait::async_trait;
-use candle_core::{Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::nomic_bert::{Config, NomicBertModel};
+use candle_core::{Device, IndexOp, Tensor,Module};
+// use candle_nn::VarBuilder;
+// use candle_transformers::models::nomic_bert::{Config, NomicBertModel};
+use candle_transformers::models::jina_bert::{Config as JinaConfig, BertModel as JinaModel};
 use hf_hub::{HFClientSync, RepoTypeAny};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
@@ -12,7 +13,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone)]
 pub struct CandleEmbedder {
-    model: Arc<NomicBertModel>,
+    model: Arc<JinaModel>,
     tokenizer: Arc<Mutex<Tokenizer>>,
     device: Device,
     query_prefix: Option<String>,
@@ -33,14 +34,10 @@ fn forward_batch(
 
     // 1. Pre-allocate and zero-initialize the entire flattened arrays once
     let mut all_ids = vec![0u32; total_elements];
-    let mut all_type_ids = vec![0u32; total_elements];
-    let mut all_masks_u8 = vec![0u8; total_elements];
 
     // 2. Overwrite the non-padded sections with actual token data
     for (i, enc) in encodings.iter().enumerate() {
         let ids = enc.get_ids();
-        let type_ids = enc.get_type_ids();
-        let mask = enc.get_attention_mask();
         let seq_len = ids.len();
 
         // Calculate the flat array boundaries for this specific document
@@ -49,23 +46,16 @@ fn forward_batch(
 
         // Fast slice copying (C-style memcopy) for contiguous memory
         all_ids[start..end].copy_from_slice(ids);
-        all_type_ids[start..end].copy_from_slice(type_ids);
 
-        // Tokenizer yields masks as u32, but Candle expects u8
-        for (j, &m) in mask.iter().enumerate() {
-            all_masks_u8[start + j] = m as u8;
-        }
     }
 
     // 3. Tensor creation and inference
     let token_tensor = Tensor::from_vec(all_ids, (batch_size, max_len), &embedder.device)?;
-    let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, max_len), &embedder.device)?;
-    let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, max_len), &embedder.device)?;
 
     let hidden_states =
         embedder
             .model
-            .forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
+            .forward(&token_tensor)?;
 
     let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
         hidden_states.to_dtype(candle_core::DType::F32)?
@@ -134,20 +124,18 @@ impl CandleEmbedder {
             .send()
             .map_err(|e| format!("Failed to download tokenizer: {}", e))?;
 
-        let config: Config = serde_json::from_reader(std::fs::File::open(config_path)?)?;
+        let config: JinaConfig = serde_json::from_reader(std::fs::File::open(config_path)?)
+            .map_err(|e| format!("Failed to parse Jina config: {}", e))?;
 
         let tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|e| format!("Tokenizer error: {}", e))?;
 
-        let dtype = if device.is_cuda() || device.is_metal() {
-            candle_core::DType::BF16
-        } else {
-            candle_core::DType::F32
-        };
+        let dtype = candle_core::DType::F32;
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
-
-        let model = NomicBertModel::load(vb, &config)
+let vb = unsafe {
+    candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
+};
+        let model = JinaModel::new( vb,&config)
             .map_err(|e| format!("Failed to load BertModel: {}", e))?;
 
         Ok(Self {
@@ -162,11 +150,11 @@ impl CandleEmbedder {
         })
     }
 
-    pub fn nomic_v1_5() -> Result<Self, BoxError> {
+    pub fn jina_v2_base_en() -> Result<Self, BoxError> {
         Self::new(
-            "nomic-ai/nomic-embed-text-v1.5",
-            Some("search_query: "),
-            Some("search_document: "),
+            "jinaai/jina-embeddings-v2-base-en",
+            None, 
+            None, 
             768,
             256,
             80_000,
@@ -174,7 +162,7 @@ impl CandleEmbedder {
     }
 
     fn encode_tokens_sync(&self, text: &str) -> Result<TokenEmbeddings, BoxError> {
-        let (token_ids, mask_ids) = {
+        let (token_ids, _mask_ids) = {
             let tokenizer = self.tokenizer.lock().unwrap();
             let tokens = tokenizer
                 .encode(text, true)
@@ -186,14 +174,10 @@ impl CandleEmbedder {
         };
 
         let token_tensor = Tensor::new(token_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-        let token_type_ids = token_tensor.zeros_like()?;
-
-        let mask_u8: Vec<u8> = mask_ids.into_iter().map(|x| x as u8).collect();
-        let attention_mask = Tensor::new(mask_u8.as_slice(), &self.device)?.unsqueeze(0)?;
 
         let hidden_states =
             self.model
-                .forward(&token_tensor, Some(&token_type_ids), Some(&attention_mask))?;
+                .forward(&token_tensor)?;
 
         let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
             hidden_states.to_dtype(candle_core::DType::F32)?
@@ -224,7 +208,7 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
             tokio::task::spawn_blocking(move || -> Result<Vec<TokenEmbeddings>, BoxError> {
                 let mut tokenizer = embedder.tokenizer.lock().unwrap();
 
-                tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
                     max_length: 8192,
                     ..Default::default()
                 }));
@@ -247,24 +231,12 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
                     }
 
                     let all_ids = encoding.get_ids();
-                    let all_type_ids = encoding.get_type_ids();
-                    let all_masks_u8: Vec<u8> = encoding
-                        .get_attention_mask()
-                        .iter()
-                        .map(|&x| x as u8)
-                        .collect();
 
                     let token_tensor =
                         Tensor::from_vec(all_ids.to_vec(), (1, seq_len), &embedder.device)?;
-                    let token_type_ids =
-                        Tensor::from_vec(all_type_ids.to_vec(), (1, seq_len), &embedder.device)?;
-                    let attention_mask =
-                        Tensor::from_vec(all_masks_u8, (1, seq_len), &embedder.device)?;
 
                     let hidden_states = embedder.model.forward(
                         &token_tensor,
-                        Some(&token_type_ids),
-                        Some(&attention_mask),
                     )?;
 
                     let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
@@ -281,7 +253,7 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
                     });
                 }
 
-                tokenizer.with_truncation(None);
+                let _ = tokenizer.with_truncation(None);
 
                 Ok(all_results)
             })
@@ -346,7 +318,7 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
         let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, BoxError> {
             let mut tokenizer = embedder.tokenizer.lock().unwrap();
 
-            tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
                 max_length: 8192,
                 ..Default::default()
             }));
@@ -407,11 +379,10 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
                 }
 
                 current_batch.clear();
-                current_max_len = 0;
             }
 
             tokenizer.with_padding(None);
-            tokenizer.with_truncation(None);
+            let _ = tokenizer.with_truncation(None);
 
             Ok(all_results)
         })
