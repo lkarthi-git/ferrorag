@@ -87,83 +87,69 @@ impl CandleReranker {
             return Ok(vec![]);
         }
 
-        let mut tokenizer = self.tokenizer.lock().unwrap();
+        // 1. Tokenize and immediately release the mutex before GPU inference
+        let encodings = {
+            let mut tokenizer = self.tokenizer.lock().unwrap();
 
-        // 1. Enable padding for the batch
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
+            tokenizer.with_padding(Some(tokenizers::PaddingParams {
+                strategy: tokenizers::PaddingStrategy::BatchLongest,
+                ..Default::default()
+            }));
 
-        // 2. Enable truncation (CRITICAL for Cross-Encoders)
-        let _result = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
-            max_length: 256,
-            strategy: tokenizers::TruncationStrategy::LongestFirst,
-            ..Default::default()
-        }));
+            let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 512,
+                strategy: tokenizers::TruncationStrategy::LongestFirst,
+                ..Default::default()
+            }));
 
-        // 3. Pair the single query with every document in the batch
-        let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, *d)).collect();
+            let pairs: Vec<(&str, &str)> = docs.iter().map(|d| (query, *d)).collect();
+            let res = tokenizer
+                .encode_batch(pairs, true)
+                .map_err(|e| format!("Batch tokenization error: {}", e));
 
-        // 4. Batch encode the pairs
-        let encodings = tokenizer
-            .encode_batch(pairs, true)
-            .map_err(|e| format!("Batch tokenization error: {}", e))?;
-
-        let batch_size = encodings.len();
-        let seq_len = encodings[0].get_ids().len();
-
-        let mut all_ids = Vec::with_capacity(batch_size * seq_len);
-        let mut all_type_ids = Vec::with_capacity(batch_size * seq_len);
-        let mut all_masks_u8 = Vec::with_capacity(batch_size * seq_len);
-
-        for encoding in &encodings {
-            all_ids.extend_from_slice(encoding.get_ids());
-            // Extract type IDs to satisfy Candle's signature
-            all_type_ids.extend_from_slice(encoding.get_type_ids());
-            all_masks_u8.extend(encoding.get_attention_mask().iter().map(|&x| x as u8));
-        }
-
-        // 5. Create 2D batch tensors
-        let input_ids = Tensor::from_vec(all_ids, (batch_size, seq_len), &self.device)?;
-        let type_ids = Tensor::from_vec(all_type_ids, (batch_size, seq_len), &self.device)?;
-        let attention_mask = Tensor::from_vec(all_masks_u8, (batch_size, seq_len), &self.device)?;
-
-        // 6. Mini-batch execution to keep the M1 cache happy
-        let chunk_size = if self.device.is_cuda() {
-            32 // Feed the NVIDIA beast massive chunks
-        } else if self.device.is_metal() {
-            16 // Keep the M1 SRAM cache happy
-        } else {
-            8 // CPU fallback (keep it very small)
+            tokenizer.with_padding(None);
+            let _ = tokenizer.with_truncation(None);
+            res?
         };
-        let mut all_scores = Vec::with_capacity(batch_size);
 
-        for i in (0..batch_size).step_by(chunk_size) {
-            let end = std::cmp::min(i + chunk_size, batch_size);
+        let seq_len = encodings[0].get_ids().len();
+        let chunk_size = if self.device.is_cuda() {
+            32
+        } else if self.device.is_metal() {
+            16
+        } else {
+            8
+        };
 
-            // Slice out 16 documents at a time
-            let chunk_input = input_ids.i((i..end, ..))?;
-            let chunk_mask = attention_mask.i((i..end, ..))?;
-            let chunk_type = type_ids.i((i..end, ..))?;
+        let mut all_scores = Vec::with_capacity(encodings.len());
 
-            // Process just the chunk
+        // 2. Mini-batch GPU execution
+        for chunk_encodings in encodings.chunks(chunk_size) {
+            let cur_bs = chunk_encodings.len();
+            let mut ids = Vec::with_capacity(cur_bs * seq_len);
+            let mut type_ids = Vec::with_capacity(cur_bs * seq_len);
+            let mut masks = Vec::with_capacity(cur_bs * seq_len);
+
+            for enc in chunk_encodings {
+                ids.extend_from_slice(enc.get_ids());
+                type_ids.extend(std::iter::repeat_n(0u32, seq_len));
+                masks.extend(enc.get_attention_mask().iter().map(|&x| x as u8));
+            }
+
+            let chunk_input = Tensor::from_vec(ids, (cur_bs, seq_len), &self.device)?;
+            let chunk_type = Tensor::from_vec(type_ids, (cur_bs, seq_len), &self.device)?;
+            let chunk_mask = Tensor::from_vec(masks, (cur_bs, seq_len), &self.device)?;
+
             let logits = self.model.forward(&chunk_input, &chunk_mask, &chunk_type)?;
 
-            // Cast and extract
-            let logits_f32 = if logits.dtype() != candle_core::DType::F32 {
-                logits.to_dtype(candle_core::DType::F32)?
-            } else {
-                logits
-            };
+            let scores = logits
+                .contiguous()?
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
 
-            let scores = logits_f32.squeeze(1)?.to_vec1::<f32>()?;
             all_scores.extend(scores);
         }
-
-        // 7. Reset tokenizer state
-        tokenizer.with_padding(None);
-        let _result = tokenizer.with_truncation(None);
 
         Ok(all_scores)
     }
@@ -253,6 +239,16 @@ impl Node for SearchAndRerankNode {
                     return Ok(results);
                 }
             };
+
+            if scores.len() != results.len() {
+                tracing::error!(
+                    "Reranker score count ({}) != result count ({})",
+                    scores.len(),
+                    results.len()
+                );
+                results.truncate(final_top_k);
+                return Ok(results);
+            }
 
             for (i, score) in scores.into_iter().enumerate() {
                 results[i].score = score;

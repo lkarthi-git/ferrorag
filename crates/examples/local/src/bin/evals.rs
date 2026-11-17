@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 3. Initialize Evaluator Components
     let evaluator = StandardDocumentEvaluator::new(5);
-    let bge_reranker_model = Arc::new(CandleReranker::new("BAAI/bge-reranker-base", "main")?);
+    let bge_reranker_model = Arc::new(CandleReranker::new("BAAI/bge-reranker-v2-m3", "main")?);
 
     let k_values = [10.0, 30.0, 60.0, 100.0, 150.0];
     for rrf_k in k_values {
@@ -55,19 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let search_node =
             VectorSearchNode::new(store.clone(), "eval_chunks", SearchMode::Hybrid { rrf_k });
 
-        // let search_and_rerank_node = SearchAndRerankNode::new(
-        //     search_node,
-        //     bge_reranker_model.clone(),
-        //     arc_query_text_map.clone(),
-        //     10,
-        // )?;
+        let search_and_rerank_node = SearchAndRerankNode::new(
+            search_node,
+            bge_reranker_model.clone(),
+            arc_query_text_map.clone(),
+            10,
+        )?;
 
-        let parent_search_node = VectorAndParentSearchNode::new(
-            BaseSearchNode::Vector(search_node),
-            store.clone(),
-            "eval_chunks",
-            2,
-        );
+        // let parent_search_node = VectorAndParentSearchNode::new(
+        //     BaseSearchNode::Vector(search_node),
+        //     store.clone(),
+        //     "eval_chunks",
+        //     2,
+        // );
 
         // let parent_search_node = VectorAndParentSearchNode::new(
         //     BaseSearchNode::SearchAndRerank(search_and_rerank_node),
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // );
         let eval_pipeline = Pipeline::from_source(eval_source, NoOpDLQ, 16)
             .pipe(query_node, 16)
-            .pipe(parent_search_node, 16);
+            .pipe(search_and_rerank_node, 16);
 
         let mut grouped_results: HashMap<String, Vec<SearchResult>> = HashMap::new();
         tracing::info!("Executing evaluation pipeline for RRF_K={}...", rrf_k);
