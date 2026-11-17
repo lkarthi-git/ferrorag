@@ -77,7 +77,7 @@ impl DatasetLoader for BeirDatasetLoader {
                 {
                     all_queries.push(Query {
                         text: text.to_string(),
-                        limit: 15,
+                        limit: 32,
                         metadata: Arc::new(QueryMetadata {
                             query_id: q_id.to_string(),
                             trace_id: format!("eval-{}", q_id),

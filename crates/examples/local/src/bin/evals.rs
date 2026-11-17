@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // 3. Initialize Evaluator Components
-    let evaluator = StandardDocumentEvaluator::new(5);
+    let evaluator = StandardDocumentEvaluator::new(10);
     let bge_reranker_model = Arc::new(CandleReranker::new("BAAI/bge-reranker-v2-m3", "main")?);
 
     let k_values = [10.0, 30.0, 60.0, 100.0, 150.0];
