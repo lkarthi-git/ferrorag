@@ -54,7 +54,7 @@ impl Node for LateChunkingNode {
             let max_seq_len = 8192; // Must match the backend's truncation limit
 
             // Calculate prefix tokens without special tokens, then add 1 for the [CLS] token
-            let prefix_token_count =  1;
+            let prefix_token_count = 1;
 
             // PHASE 1: Batch Preparation (CPU)
             let tokenizer_clone = tokenizer.clone();
@@ -64,6 +64,9 @@ impl Node for LateChunkingNode {
 
                 for parent_chunk in parent_chunks {
                     let text = parent_chunk.text.to_string();
+                    if text.is_empty() {
+                        continue; // Prevent 0-length tensors on the GPU
+                    }
                     formatted_inputs.push(text.clone());
 
                     // Tokenize EXACTLY as the backend will (with special tokens)

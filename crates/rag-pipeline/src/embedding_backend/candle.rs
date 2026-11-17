@@ -1,10 +1,11 @@
 use crate::embedding::token::TokenEmbeddings;
 use crate::embedding_backend::AdvancedEmbeddingBackend;
 use async_trait::async_trait;
-use candle_core::{Device, IndexOp, Tensor,Module};
+use candle_core::{Device, IndexOp, Module, Tensor};
+
 // use candle_nn::VarBuilder;
 // use candle_transformers::models::nomic_bert::{Config, NomicBertModel};
-use candle_transformers::models::jina_bert::{Config as JinaConfig, BertModel as JinaModel};
+use candle_transformers::models::jina_bert::{BertModel as JinaModel, Config as JinaConfig};
 use hf_hub::{HFClientSync, RepoTypeAny};
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
@@ -46,16 +47,12 @@ fn forward_batch(
 
         // Fast slice copying (C-style memcopy) for contiguous memory
         all_ids[start..end].copy_from_slice(ids);
-
     }
 
     // 3. Tensor creation and inference
     let token_tensor = Tensor::from_vec(all_ids, (batch_size, max_len), &embedder.device)?;
 
-    let hidden_states =
-        embedder
-            .model
-            .forward(&token_tensor)?;
+    let hidden_states = embedder.model.forward(&token_tensor)?;
 
     let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
         hidden_states.to_dtype(candle_core::DType::F32)?
@@ -132,11 +129,12 @@ impl CandleEmbedder {
 
         let dtype = candle_core::DType::F32;
 
-let vb = unsafe {
-    candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
-};
-        let model = JinaModel::new( vb,&config)
-            .map_err(|e| format!("Failed to load BertModel: {}", e))?;
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)?
+        };
+
+        let model =
+            JinaModel::new(vb, &config).map_err(|e| format!("Failed to load BertModel: {}", e))?;
 
         Ok(Self {
             model: Arc::new(model),
@@ -153,8 +151,8 @@ let vb = unsafe {
     pub fn jina_v2_base_en() -> Result<Self, BoxError> {
         Self::new(
             "jinaai/jina-embeddings-v2-base-en",
-            None, 
-            None, 
+            None,
+            None,
             768,
             256,
             80_000,
@@ -162,32 +160,27 @@ let vb = unsafe {
     }
 
     fn encode_tokens_sync(&self, text: &str) -> Result<TokenEmbeddings, BoxError> {
-        let (token_ids, _mask_ids) = {
+        let token_ids = {
             let tokenizer = self.tokenizer.lock().unwrap();
             let tokens = tokenizer
                 .encode(text, true)
                 .map_err(|e| format!("Token error: {}", e))?;
-            (
-                tokens.get_ids().to_vec(),
-                tokens.get_attention_mask().to_vec(),
-            )
+            tokens.get_ids().to_vec()
         };
 
         let token_tensor = Tensor::new(token_ids.as_slice(), &self.device)?.unsqueeze(0)?;
 
-        let hidden_states =
-            self.model
-                .forward(&token_tensor)?;
+        let hidden_states = self.model.forward(&token_tensor)?;
 
-        let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
-            hidden_states.to_dtype(candle_core::DType::F32)?
-        } else {
-            hidden_states
-        };
+        // Synchronize, make contiguous, and move to CPU just like embed_document_tokens
+        let cpu_hidden = hidden_states
+            .contiguous()?
+            .to_dtype(candle_core::DType::F32)?
+            .to_device(&Device::Cpu)?;
 
         Ok(TokenEmbeddings {
-            hidden_states,
-            device: self.device.clone(),
+            hidden_states: cpu_hidden,
+            device: Device::Cpu,
         })
     }
 }
@@ -235,21 +228,17 @@ impl AdvancedEmbeddingBackend for CandleEmbedder {
                     let token_tensor =
                         Tensor::from_vec(all_ids.to_vec(), (1, seq_len), &embedder.device)?;
 
-                    let hidden_states = embedder.model.forward(
-                        &token_tensor,
-                    )?;
+                    let hidden_states = embedder.model.forward(&token_tensor)?;
 
-                    let hidden_states = if hidden_states.dtype() != candle_core::DType::F32 {
-                        hidden_states.to_dtype(candle_core::DType::F32)?
-                    } else {
-                        hidden_states
-                    };
+                    let hidden_states = hidden_states
+                        .contiguous()?
+                        .to_dtype(candle_core::DType::F32)?;
 
-                    let doc_hidden = hidden_states.i((0, .., ..))?.contiguous()?;
+                    let cpu_hidden = hidden_states.to_device(&Device::Cpu)?;
 
                     all_results.push(TokenEmbeddings {
-                        hidden_states: doc_hidden.unsqueeze(0)?,
-                        device: embedder.device.clone(),
+                        hidden_states: cpu_hidden,
+                        device: Device::Cpu,
                     });
                 }
 

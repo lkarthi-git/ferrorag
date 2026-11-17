@@ -13,32 +13,30 @@ impl TokenEmbeddings {
     /// `spans` are pairs of (start_token_index, end_token_index)
     pub fn pool_spans(&self, spans: &[(usize, usize)]) -> Result<Vec<Vec<f32>>, BoxError> {
         let mut final_vectors = Vec::with_capacity(spans.len());
+        let seq_len = self.hidden_states.dim(1)?;
 
         for &(start, end) in spans {
-            let chunk_len = end - start;
-            if chunk_len == 0 {
+            let chunk_len = end.saturating_sub(start);
+            if chunk_len == 0 || end > seq_len {
                 continue;
             }
 
-            // 1. Slice the window from the full tensor
-            let span_tensor = self.hidden_states.narrow(1, start, chunk_len)?;
-
-            // 2. Mean Pool the span
+            let span_tensor = self
+                .hidden_states
+                .narrow(1, start, chunk_len)?
+                .contiguous()?;
             let sum_embeddings = span_tensor.sum(1)?;
             let mean_pooled = (sum_embeddings / (chunk_len as f64))?;
 
-            // 3. L2 Normalize (Standard practice for Jina / Cosine Similarity)
             let l2_norm = mean_pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
-            
-            // Ensure eps matches the dtype of mean_pooled (f32 or bf16)
-            let eps = Tensor::new(1e-12f32, &self.device)?.to_dtype(mean_pooled.dtype())?;
-
+            let eps = Tensor::new(1e-12f32, &Device::Cpu)?;
             let safe_l2_norm = l2_norm.broadcast_add(&eps)?;
             let normalized = mean_pooled.broadcast_div(&safe_l2_norm)?;
 
-            // 4. Move only the final 768-dimensional chunk vector to CPU
-            let vec2d: Vec<Vec<f32>> = normalized.to_vec2()?;
-            if let Some(vec) = vec2d.into_iter().next() {
+            if let Some(vec) = normalized.to_vec2::<f32>()?.into_iter().next() {
+                if vec.iter().any(|v| !v.is_finite()) {
+                    return Err(format!("Non-finite embedding in span ({start}..{end})").into());
+                }
                 final_vectors.push(vec);
             }
         }
