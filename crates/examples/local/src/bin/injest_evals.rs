@@ -4,7 +4,7 @@ use ferro_rag::{
     document::{DocumentParserNode, json::JsonlParserStrategy},
     embedding::chunk::ChunkEmbeddingNode,
     embedding::late_chunk::LateChunkingNode,
-    embedding_backend::{AdvancedEmbeddingBackend, candle::CandleEmbedder},
+    embedding_backend::{AdvancedEmbeddingBackend, ort::OrtEmbedder},
     extraction::GraphExtractionNode,
     source::FileSource,
     store::{self, VectorStore, dedup::DeduplicatorNode, vector_store_node::VectorStorageNode},
@@ -28,8 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         8000,
         256,
     ));
-
-    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
+    let local_embedder = Arc::new(OrtEmbedder::jina_v2_base_en().unwrap());
     let db_path = "data/lancedb_eval";
     let store = Arc::new(
         store::lancedb::LanceDbStore::new(db_path, local_embedder.vector_dimension() as i32)

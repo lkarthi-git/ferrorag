@@ -5,6 +5,11 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub mod candle;
 
 
+#[cfg(feature = "ort")]
+pub mod ort;
+
+
+
 #[async_trait::async_trait]
 pub trait EmbeddingBackend: Send + Sync {
     /// Embeds a single query string.

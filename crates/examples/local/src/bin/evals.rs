@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferro_rag::embedding_backend::AdvancedEmbeddingBackend;
-use ferro_rag::embedding_backend::candle::CandleEmbedder;
+use ferro_rag::embedding_backend::ort::OrtEmbedder;
 use ferro_rag::{
     embedding::query::QueryEmbeddingNode,
     search::BaseSearchNode,
     search::parent::VectorAndParentSearchNode,
-    search::rerank::{CandleReranker, SearchAndRerankNode},
+    search::rerank::{SearchAndRerankNode},
     search::{SearchMode, vector::VectorSearchNode},
+    reranker_backend::{RerankerBackend, ort::OrtReranker},
     source::memory_source::MemorySource,
     store::{self, SearchResult},
 };
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // 2. Initialize Pipeline Architecture
-    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
+    let local_embedder = Arc::new(OrtEmbedder::jina_v2_base_en().unwrap());
     let db_path = "data/lancedb_eval";
     let store = Arc::new(
         store::lancedb::LanceDbStore::new(db_path, local_embedder.vector_dimension() as i32)
@@ -45,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 3. Initialize Evaluator Components
     let evaluator = StandardDocumentEvaluator::new(10);
-    let bge_reranker_model = Arc::new(CandleReranker::new("BAAI/bge-reranker-v2-m3", "main")?);
+    let bge_reranker_model = Arc::new(OrtReranker::bge_reranker_v2_m3().unwrap());
 
     let k_values = [10.0, 30.0, 60.0, 100.0, 150.0];
     for rrf_k in k_values {

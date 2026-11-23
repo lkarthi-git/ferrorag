@@ -5,7 +5,7 @@ pub mod vector;
 pub mod print;
 pub mod parent;
 
-#[cfg(feature = "candle")]
+#[cfg(any(feature = "candle", feature = "ort"))]
 pub mod rerank;
 
 

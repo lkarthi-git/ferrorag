@@ -3,7 +3,7 @@ use ferro_core::dlq::NoOpDLQ;
 use ferro_rag::source::memory_source::MemorySource;
 use ferro_rag::store::{self, VectorStore};
 use ferro_rag::embedding::query::QueryEmbeddingNode;
-use ferro_rag::embedding_backend::candle::CandleEmbedder;
+use ferro_rag::embedding_backend::ort::OrtEmbedder;
 use ferro_rag::embedding_backend::AdvancedEmbeddingBackend;
 use ferro_rag::search::{Query,SearchMode,QueryMetadata};
 use ferro_rag::search::vector::VectorSearchNode;
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Searching for: '{}' using mode: {:?}", query_text, mode);
 
     // 1. Initialize Backend & Extract Dimension
-    let local_embedder = Arc::new(CandleEmbedder::jina_v2_base_en().unwrap());
+    let local_embedder = Arc::new(OrtEmbedder::jina_v2_base_en().unwrap());
     let dimension = local_embedder.vector_dimension();
 
     // 2. Initialize Store using dynamic dimension

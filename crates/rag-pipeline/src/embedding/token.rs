@@ -1,44 +1,47 @@
-use candle_core::{Device, Tensor};
-
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TokenEmbeddings {
-    pub hidden_states: Tensor,
-    pub device: Device,
+    pub data: Vec<f32>,
+    pub seq_len: usize,
+    pub hidden_dim: usize,
 }
 
 impl TokenEmbeddings {
-    /// Pools specific token spans directly on the GPU.
-    /// `spans` are pairs of (start_token_index, end_token_index)
     pub fn pool_spans(&self, spans: &[(usize, usize)]) -> Result<Vec<Vec<f32>>, BoxError> {
         let mut final_vectors = Vec::with_capacity(spans.len());
-        let seq_len = self.hidden_states.dim(1)?;
 
         for &(start, end) in spans {
             let chunk_len = end.saturating_sub(start);
-            if chunk_len == 0 || end > seq_len {
+            if chunk_len == 0 || end > self.seq_len {
                 continue;
             }
 
-            let span_tensor = self
-                .hidden_states
-                .narrow(1, start, chunk_len)?
-                .contiguous()?;
-            let sum_embeddings = span_tensor.sum(1)?;
-            let mean_pooled = (sum_embeddings / (chunk_len as f64))?;
+            let mut pooled = vec![0.0f32; self.hidden_dim];
+            for token_idx in start..end {
+                let row_start = token_idx * self.hidden_dim;
+                let row = &self.data[row_start..row_start + self.hidden_dim];
+                for (acc, &val) in pooled.iter_mut().zip(row.iter()) {
+                    *acc += val;
+                }
+            }
 
-            let l2_norm = mean_pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
-            let eps = Tensor::new(1e-12f32, &Device::Cpu)?;
-            let safe_l2_norm = l2_norm.broadcast_add(&eps)?;
-            let normalized = mean_pooled.broadcast_div(&safe_l2_norm)?;
+            let inv_len = 1.0 / (chunk_len as f32);
+            let mut sq_sum = 0.0f32;
+            for val in &mut pooled {
+                *val *= inv_len;
+                sq_sum += *val * *val;
+            }
 
-            if let Some(vec) = normalized.to_vec2::<f32>()?.into_iter().next() {
-                if vec.iter().any(|v| !v.is_finite()) {
+            let norm = (sq_sum.sqrt() + 1e-12).max(1e-12);
+            for val in &mut pooled {
+                *val /= norm;
+                if !val.is_finite() {
                     return Err(format!("Non-finite embedding in span ({start}..{end})").into());
                 }
-                final_vectors.push(vec);
             }
+
+            final_vectors.push(pooled);
         }
 
         Ok(final_vectors)
